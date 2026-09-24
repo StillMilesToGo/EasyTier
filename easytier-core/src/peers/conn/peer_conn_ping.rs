@@ -14,7 +14,7 @@ use tokio::{
 
 use crate::{
     config::PeerId,
-    foundation::time::{Interval, interval, timeout},
+    foundation::time::{sleep, timeout},
     packet::{PacketType, ZCPacket},
     peers::{conn::peer_conn_liveness::PeerConnLiveness, context::ArcPeerContext, error::Error},
     tunnel::{
@@ -22,6 +22,14 @@ use crate::{
         stats::{Throughput, WindowLatency},
     },
 };
+
+// Randomized so idle heartbeats have no fixed period. The longest idle gap
+// (32 ticks * 80% * 1.25s) stays within the previous fixed 32s maximum, so NAT
+// mappings are kept alive as before.
+const PING_TICK_MS_MIN: u64 = 750;
+const PING_TICK_MS_MAX: u64 = 1250;
+const PING_GAP_PERCENT_MIN: u64 = 50;
+const PING_GAP_PERCENT_MAX: u64 = 80;
 
 #[derive(Debug)]
 enum PingResponse {
@@ -33,7 +41,6 @@ struct PingIntervalController {
     throughput: Arc<Throughput>,
     loss_counter: Arc<AtomicU32>,
 
-    interval: Interval,
     max_interval: Duration,
 
     logic_time: u64,
@@ -41,6 +48,8 @@ struct PingIntervalController {
 
     backoff_idx: i32,
     max_backoff_idx: i32,
+    // percentage of the backoff gap to wait, resampled after every ping
+    gap_percent: u64,
 
     last_throughput: Throughput,
 }
@@ -54,6 +63,7 @@ impl std::fmt::Debug for PingIntervalController {
             .field("last_send_logic_time", &self.last_send_logic_time)
             .field("backoff_idx", &self.backoff_idx)
             .field("max_backoff_idx", &self.max_backoff_idx)
+            .field("gap_percent", &self.gap_percent)
             .field("max_interval", &self.max_interval)
             .field("last_throughput", &self.last_throughput)
             .finish()
@@ -71,20 +81,41 @@ impl PingIntervalController {
         Self {
             throughput,
             loss_counter,
-            interval: interval(Duration::from_secs(1)),
             max_interval,
             logic_time: 0,
             last_send_logic_time: 0,
 
             backoff_idx: 0,
             max_backoff_idx: 5,
+            gap_percent: Self::sample_gap_percent(),
 
             last_throughput,
         }
     }
 
+    fn sample_gap_percent() -> u64 {
+        thread_rng().gen_range(PING_GAP_PERCENT_MIN..=PING_GAP_PERCENT_MAX)
+    }
+
+    fn sample_tick_duration() -> Duration {
+        Duration::from_millis(thread_rng().gen_range(PING_TICK_MS_MIN..=PING_TICK_MS_MAX))
+    }
+
+    // the longest gap whose randomized ticks still fit within max_interval;
+    // limits shorter than one tick ping on every tick
+    fn max_gap_ticks(&self) -> u64 {
+        (self.max_interval.as_millis() as u64 / PING_TICK_MS_MAX).max(1)
+    }
+
+    fn gap_ticks(&self) -> u64 {
+        ((1u64 << self.backoff_idx) * self.gap_percent / 100).clamp(1, self.max_gap_ticks())
+    }
+
     async fn tick(&mut self) {
-        self.interval.tick().await;
+        // the first tick fires immediately, like tokio's interval
+        if self.logic_time > 0 {
+            sleep(Self::sample_tick_duration()).await;
+        }
         self.logic_time += 1;
     }
 
@@ -106,17 +137,13 @@ impl PingIntervalController {
 
         self.last_throughput = (*self.throughput).clone();
 
-        let send_interval = Duration::from_secs(1 << self.backoff_idx).min(self.max_interval);
-        if Duration::from_secs(self.logic_time - self.last_send_logic_time) < send_interval {
+        if (self.logic_time - self.last_send_logic_time) < self.gap_ticks() {
             return false;
         }
 
         self.backoff_idx = std::cmp::min(self.backoff_idx + 1, self.max_backoff_idx);
-
-        // use this makes two peers not pingpong at the same time
-        if self.backoff_idx > self.max_backoff_idx - 2 && thread_rng().gen_bool(0.2) {
-            self.backoff_idx -= 1;
-        }
+        // also keeps two peers from pinging each other at the same time
+        self.gap_percent = Self::sample_gap_percent();
 
         self.last_send_logic_time = self.logic_time;
         true
@@ -359,10 +386,17 @@ mod tests {
             Duration::from_secs(1),
         );
 
-        let started_at = tokio::time::Instant::now();
-        for second in 0..100 {
+        controller.tick().await;
+        assert!(controller.should_send_ping());
+        for _ in 0..100 {
+            let started_at = tokio::time::Instant::now();
             controller.tick().await;
-            assert_eq!(started_at.elapsed(), Duration::from_secs(second));
+            let elapsed = started_at.elapsed();
+            assert!(
+                (Duration::from_millis(PING_TICK_MS_MIN)..=Duration::from_millis(PING_TICK_MS_MAX))
+                    .contains(&elapsed),
+                "{elapsed:?}"
+            );
             assert!(controller.should_send_ping());
             assert!(!controller.should_send_ping());
         }
@@ -371,16 +405,24 @@ mod tests {
     #[cfg(not(target_os = "wasi"))]
     #[tokio::test(start_paused = true)]
     async fn ping_backoff_respects_non_power_of_two_limit() {
+        let limit = Duration::from_secs(3);
         let mut controller = PingIntervalController::new(
             Arc::new(Throughput::new()),
             Arc::new(AtomicU32::new(0)),
-            Duration::from_secs(3),
+            limit,
         );
 
-        for tick in 1..=100 {
+        controller.tick().await;
+        assert!(controller.should_send_ping());
+        let mut last_ping = tokio::time::Instant::now();
+        for _ in 0..100 {
             controller.tick().await;
-            assert_eq!(controller.should_send_ping(), tick == 1 || tick % 3 == 0);
+            if controller.should_send_ping() {
+                assert!(last_ping.elapsed() <= limit, "{:?}", last_ping.elapsed());
+                last_ping = tokio::time::Instant::now();
+            }
         }
+        assert!(last_ping.elapsed() <= limit);
     }
 
     #[cfg(not(target_os = "wasi"))]
@@ -393,16 +435,52 @@ mod tests {
             Duration::from_secs(32),
         );
 
-        for second in 1..=14 {
+        let mut ping_ticks = Vec::new();
+        for tick in 1..=14 {
             controller.tick().await;
-            assert_eq!(controller.should_send_ping(), matches!(second, 1 | 3 | 7));
+            if controller.should_send_ping() {
+                ping_ticks.push(tick);
+            }
         }
+        // gaps of 1, 2..=3 and 4..=6 ticks
+        assert_eq!(ping_ticks[..2], [1, 2], "{ping_ticks:?}");
+        assert!((4..=5).contains(&ping_ticks[2]), "{ping_ticks:?}");
+        assert!(ping_ticks.len() <= 4, "{ping_ticks:?}");
 
         loss_counter.store(1, Ordering::Relaxed);
         for _ in 0..3 {
             controller.tick().await;
             assert!(controller.should_send_ping());
         }
+    }
+
+    #[test]
+    fn idle_ping_gaps_are_randomized_within_bounds() {
+        let mut controller = PingIntervalController::new(
+            Arc::new(Throughput::new()),
+            Arc::new(AtomicU32::new(0)),
+            Duration::from_secs(32),
+        );
+        let mut gaps = std::collections::HashSet::new();
+        for _ in 0..20_000 {
+            controller.logic_time += 1;
+            let last_send = controller.last_send_logic_time;
+            let saturated = controller.backoff_idx == controller.max_backoff_idx;
+            if controller.should_send_ping() && saturated {
+                gaps.insert(controller.logic_time - last_send);
+            }
+        }
+
+        let max_gap = 32 * PING_GAP_PERCENT_MAX / 100;
+        assert!(gaps.len() > 1, "idle ping gap is fixed: {gaps:?}");
+        assert!(
+            gaps.iter().all(|gap| (16..=max_gap).contains(gap)),
+            "{gaps:?}"
+        );
+        assert!(
+            max_gap * PING_TICK_MS_MAX <= 32_000,
+            "idle ping gap exceeds the previous 32s maximum"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
