@@ -362,6 +362,22 @@ impl easytier_core::socket::SocketListener for WsTunnelListener {
     }
 }
 
+/// Browsers omit SNI for IP literals (RFC 6066), and rustls does the same for
+/// `ServerName::IpAddress`, so IP URLs produce a browser-like ClientHello.
+fn tls_server_name(
+    url: &url::Url,
+) -> Result<rustls::pki_types::ServerName<'static>, TunnelError> {
+    match url.host() {
+        Some(url::Host::Domain(domain)) => {
+            rustls::pki_types::ServerName::try_from(domain.to_owned())
+                .map_err(|_| TunnelError::InvalidProtocol("Invalid SNI".to_owned()))
+        }
+        Some(url::Host::Ipv4(ip)) => Ok(IpAddr::V4(ip).into()),
+        Some(url::Host::Ipv6(ip)) => Ok(IpAddr::V6(ip).into()),
+        None => Err(TunnelError::InvalidAddr(url.to_string())),
+    }
+}
+
 pub(crate) async fn upgrade_connected<S>(
     stream: S,
     remote_url: url::Url,
@@ -392,10 +408,7 @@ where
     let stream: MaybeTlsStream<S> = if is_wss {
         init_crypto_provider();
         let tls = tokio_rustls::TlsConnector::from(Arc::new(get_insecure_tls_client_config()));
-        let sni = remote_url.domain().unwrap_or("localhost").to_owned();
-        let server_name = rustls::pki_types::ServerName::try_from(sni)
-            .map_err(|_| TunnelError::InvalidProtocol("Invalid SNI".to_owned()))?;
-        MaybeTlsStream::Rustls(tls.connect(server_name, stream).await?)
+        MaybeTlsStream::Rustls(tls.connect(tls_server_name(&remote_url)?, stream).await?)
     } else {
         MaybeTlsStream::Plain(stream)
     };
@@ -471,6 +484,68 @@ pub mod tests {
             .expect_err("send should fail");
         sink.close().await.expect_err("close should fail");
         assert!(sink.inner.close_called);
+    }
+
+    fn client_hello_sni(record: &[u8]) -> Option<String> {
+        let read_u16 =
+            |buf: &[u8], pos: usize| u16::from_be_bytes([buf[pos], buf[pos + 1]]) as usize;
+        assert_eq!(record[0], 22, "expected a TLS handshake record");
+        let handshake = &record[5..];
+        assert_eq!(handshake[0], 1, "expected a ClientHello");
+        let body = &handshake[4..];
+
+        let mut pos = 2 + 32;
+        pos += 1 + body[pos] as usize;
+        pos += 2 + read_u16(body, pos);
+        pos += 1 + body[pos] as usize;
+        let extensions_end = pos + 2 + read_u16(body, pos);
+        pos += 2;
+        while pos < extensions_end {
+            let ext_type = read_u16(body, pos);
+            let ext_len = read_u16(body, pos + 2);
+            let ext = &body[pos + 4..pos + 4 + ext_len];
+            if ext_type == 0 {
+                let name_len = read_u16(ext, 3);
+                return Some(String::from_utf8(ext[5..5 + name_len].to_vec()).unwrap());
+            }
+            pos += 4 + ext_len;
+        }
+        None
+    }
+
+    async fn capture_client_hello_sni(remote_url: &str) -> Option<String> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let remote_url: url::Url = remote_url.parse().unwrap();
+        let client = tokio::spawn(async move {
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let _ = upgrade_connected(RuntimeTcpSocket::new(stream), remote_url).await;
+        });
+
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut record = vec![0u8; 5];
+        stream.read_exact(&mut record).await.unwrap();
+        let len = u16::from_be_bytes([record[3], record[4]]) as usize;
+        record.resize(5 + len, 0);
+        stream.read_exact(&mut record[5..]).await.unwrap();
+        drop(stream);
+        client.abort();
+
+        client_hello_sni(&record)
+    }
+
+    #[tokio::test]
+    async fn wss_omits_sni_for_ip_hosts() {
+        assert_eq!(capture_client_hello_sni("wss://127.0.0.1:1443/p").await, None);
+        assert_eq!(capture_client_hello_sni("wss://[::1]:1443/p").await, None);
+    }
+
+    #[tokio::test]
+    async fn wss_sends_domain_as_sni() {
+        assert_eq!(
+            capture_client_hello_sni("wss://et.example.com:1443/p").await,
+            Some("et.example.com".to_owned())
+        );
     }
 
     #[tokio::test]
