@@ -858,6 +858,12 @@ impl Cli {
             }
 
             let (scheme, rest) = l.split_once(':').unwrap_or((&l, ""));
+            #[cfg(feature = "mqtt")]
+            if crate::tunnel::mqtt::supports_scheme(scheme) {
+                crate::tunnel::mqtt::MqttEndpoint::parse(&l.parse()?)?;
+                parsed.push(l);
+                continue;
+            }
             let Ok(scheme) = scheme.parse::<IpScheme>() else {
                 anyhow::bail!("invalid listener: {}", l);
             };
@@ -1902,6 +1908,22 @@ mod tests {
                 Cli::parse_listeners(false, vec![input.to_string()]).is_err(),
                 "input: {}",
                 input
+            );
+        }
+    }
+
+    #[cfg(feature = "mqtt")]
+    #[test]
+    fn test_parse_mqtt_listeners() {
+        let input = "mqtts://user:pass@broker.example:8883/et/node-a?qos=0".to_string();
+        assert_eq!(
+            Cli::parse_listeners(false, vec![input.clone()]).unwrap(),
+            vec![input]
+        );
+        for input in ["mqtt://broker.example", "mqtt://broker.example/et?qos=5"] {
+            assert!(
+                Cli::parse_listeners(false, vec![input.to_string()]).is_err(),
+                "input: {input}"
             );
         }
     }

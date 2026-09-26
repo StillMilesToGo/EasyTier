@@ -345,7 +345,8 @@ where
     }
 }
 
-pub(crate) fn upgrade_connected_byte_stream<S>(
+/// Frames a host-created client byte stream as an EasyTier tunnel.
+pub fn upgrade_connected_byte_stream<S>(
     connected: ConnectedByteStream<S>,
 ) -> Result<Box<dyn Tunnel>, TunnelError>
 where
@@ -426,7 +427,8 @@ fn is_retryable_accepted_tcp_error(error: &TunnelError) -> bool {
     )
 }
 
-pub(crate) fn upgrade_accepted_byte_stream<S>(
+/// Frames a host-accepted server byte stream as an EasyTier tunnel.
+pub fn upgrade_accepted_byte_stream<S>(
     socket: S,
     local_url: Url,
     remote_url: Option<Url>,

@@ -35,6 +35,12 @@ pub(crate) const fn protocol_transport(scheme: &str) -> Option<ProtocolTransport
     }
 }
 
+/// Returns whether a scheme is carried by a byte stream the Host creates
+/// itself (for example over a message broker) rather than by a core socket.
+pub const fn is_host_byte_stream_scheme(scheme: &str) -> bool {
+    matches!(scheme.as_bytes(), b"mqtt" | b"mqtts")
+}
+
 pub(crate) const fn protocol_uses_udp(scheme: &str) -> bool {
     matches!(protocol_transport(scheme), Some(ProtocolTransport::Udp(_)))
 }

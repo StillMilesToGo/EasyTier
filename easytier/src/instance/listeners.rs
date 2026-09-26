@@ -20,6 +20,7 @@ impl ExternalListenerFactory<AcceptedTransport<RuntimeTcpSocket>>
         match scheme {
             "faketcp" => cfg!(feature = "faketcp"),
             "unix" => cfg!(unix),
+            "mqtt" | "mqtts" => cfg!(feature = "mqtt"),
             _ => false,
         }
     }
@@ -36,6 +37,10 @@ impl ExternalListenerFactory<AcceptedTransport<RuntimeTcpSocket>>
             )),
             #[cfg(unix)]
             "unix" => Box::new(RuntimeUnixStreamListener::new(request.url)),
+            #[cfg(feature = "mqtt")]
+            scheme if crate::tunnel::mqtt::supports_scheme(scheme) => Box::new(
+                crate::tunnel::mqtt::MqttListener::new(request.url, request.socket_context),
+            ),
             scheme => unreachable!("core requested unsupported external listener: {scheme}"),
         }
     }

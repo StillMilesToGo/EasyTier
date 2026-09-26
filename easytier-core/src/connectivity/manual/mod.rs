@@ -21,7 +21,10 @@ use url::Url;
 use crate::tunnel::ring::RingTunnelRegistry;
 use crate::{
     connectivity::{
-        protocol::{ClientProtocolUpgrader, ProtocolTransport, protocol_transport},
+        protocol::{
+            ClientProtocolUpgrader, ProtocolTransport, is_host_byte_stream_scheme,
+            protocol_transport,
+        },
         transport::{self, ConnectedByteStream, ConnectedTransport, UdpSessionMode},
     },
     events::{CoreEvent, CoreEventSink},
@@ -69,6 +72,7 @@ impl ManualTransport {
             Some(ProtocolTransport::FakeTcp) => Ok(Self::Tcp(TcpSocketPurpose::FakeTcp)),
             Some(ProtocolTransport::Udp(mode)) => Ok(Self::Udp(mode)),
             None if matches!(url.scheme(), "ring" | "unix") => Ok(Self::ByteStream),
+            None if is_host_byte_stream_scheme(url.scheme()) => Ok(Self::ByteStream),
             None => anyhow::bail!("unsupported core manual connector URL: {url}"),
         }
     }

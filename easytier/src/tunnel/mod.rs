@@ -20,6 +20,9 @@ pub mod quic;
 #[cfg(feature = "websocket")]
 pub mod websocket;
 
+#[cfg(feature = "mqtt")]
+pub mod mqtt;
+
 pub fn build_url_from_socket_addr(addr: &String, scheme: &str) -> url::Url {
     if let Ok(sock_addr) = addr.parse::<SocketAddr>() {
         let url_str = format!("{}://0.0.0.0", scheme);
@@ -162,6 +165,10 @@ pub enum TunnelScheme {
     Ip(IpScheme),
     #[cfg(unix)]
     Unix,
+    #[cfg(feature = "mqtt")]
+    Mqtt,
+    #[cfg(feature = "mqtt")]
+    Mqtts,
     // Only for connector
     Http,
     Https,

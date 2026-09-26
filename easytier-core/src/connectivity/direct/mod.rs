@@ -426,6 +426,9 @@ where
             .into_iter()
             .map(Into::<Url>::into)
             .filter(|listener| listener.scheme() != "ring")
+            // Broker-relayed and other host byte-stream listeners are not
+            // reachable through a direct socket.
+            .filter(|listener| protocol_transport(listener.scheme()).is_some())
             .filter(|listener| {
                 mapped_listener_port(listener).is_some() && listener.host().is_some()
             })

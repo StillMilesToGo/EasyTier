@@ -33,6 +33,9 @@ enum RuntimeTcpSocketInner {
     Unix(UnixStream),
     #[cfg(feature = "faketcp")]
     FakeTcp(crate::socket::fake_tcp::FakeTcpSocket),
+    /// A pipe whose far end is relayed by the host, e.g. through MQTT.
+    #[cfg(feature = "mqtt")]
+    Duplex(tokio::io::DuplexStream),
 }
 
 pub struct RuntimeTcpSocket {
@@ -62,6 +65,13 @@ impl RuntimeTcpSocket {
             inner: RuntimeTcpSocketInner::FakeTcp(socket),
         }
     }
+
+    #[cfg(feature = "mqtt")]
+    pub(crate) fn from_duplex(stream: tokio::io::DuplexStream) -> Self {
+        Self {
+            inner: RuntimeTcpSocketInner::Duplex(stream),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -83,6 +93,8 @@ impl AsyncRead for RuntimeTcpSocket {
             RuntimeTcpSocketInner::Unix(stream) => Pin::new(stream).poll_read(cx, buf),
             #[cfg(feature = "faketcp")]
             RuntimeTcpSocketInner::FakeTcp(socket) => Pin::new(socket).poll_read(cx, buf),
+            #[cfg(feature = "mqtt")]
+            RuntimeTcpSocketInner::Duplex(stream) => Pin::new(stream).poll_read(cx, buf),
         }
     }
 }
@@ -99,6 +111,8 @@ impl AsyncWrite for RuntimeTcpSocket {
             RuntimeTcpSocketInner::Unix(stream) => Pin::new(stream).poll_write(cx, buf),
             #[cfg(feature = "faketcp")]
             RuntimeTcpSocketInner::FakeTcp(socket) => Pin::new(socket).poll_write(cx, buf),
+            #[cfg(feature = "mqtt")]
+            RuntimeTcpSocketInner::Duplex(stream) => Pin::new(stream).poll_write(cx, buf),
         }
     }
 
@@ -109,6 +123,8 @@ impl AsyncWrite for RuntimeTcpSocket {
             RuntimeTcpSocketInner::Unix(stream) => Pin::new(stream).poll_flush(cx),
             #[cfg(feature = "faketcp")]
             RuntimeTcpSocketInner::FakeTcp(socket) => Pin::new(socket).poll_flush(cx),
+            #[cfg(feature = "mqtt")]
+            RuntimeTcpSocketInner::Duplex(stream) => Pin::new(stream).poll_flush(cx),
         }
     }
 
@@ -119,6 +135,8 @@ impl AsyncWrite for RuntimeTcpSocket {
             RuntimeTcpSocketInner::Unix(stream) => Pin::new(stream).poll_shutdown(cx),
             #[cfg(feature = "faketcp")]
             RuntimeTcpSocketInner::FakeTcp(socket) => Pin::new(socket).poll_shutdown(cx),
+            #[cfg(feature = "mqtt")]
+            RuntimeTcpSocketInner::Duplex(stream) => Pin::new(stream).poll_shutdown(cx),
         }
     }
 }
@@ -140,6 +158,11 @@ impl VirtualTcpSocket for RuntimeTcpSocket {
                 let (reader, writer) = tokio::io::split(socket);
                 (Box::new(reader), Box::new(writer))
             }
+            #[cfg(feature = "mqtt")]
+            RuntimeTcpSocketInner::Duplex(stream) => {
+                let (reader, writer) = tokio::io::split(stream);
+                (Box::new(reader), Box::new(writer))
+            }
         }
     }
 
@@ -153,6 +176,11 @@ impl VirtualTcpSocket for RuntimeTcpSocket {
             )),
             #[cfg(feature = "faketcp")]
             RuntimeTcpSocketInner::FakeTcp(socket) => socket.local_addr(),
+            #[cfg(feature = "mqtt")]
+            RuntimeTcpSocketInner::Duplex(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "relayed stream has no IP local address",
+            )),
         }
     }
 
@@ -166,6 +194,11 @@ impl VirtualTcpSocket for RuntimeTcpSocket {
             )),
             #[cfg(feature = "faketcp")]
             RuntimeTcpSocketInner::FakeTcp(socket) => socket.peer_addr(),
+            #[cfg(feature = "mqtt")]
+            RuntimeTcpSocketInner::Duplex(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "relayed stream has no IP peer address",
+            )),
         }
     }
 
@@ -176,6 +209,8 @@ impl VirtualTcpSocket for RuntimeTcpSocket {
             RuntimeTcpSocketInner::Tcp(_) => None,
             #[cfg(unix)]
             RuntimeTcpSocketInner::Unix(_) => None,
+            #[cfg(feature = "mqtt")]
+            RuntimeTcpSocketInner::Duplex(_) => None,
         }
     }
 }

@@ -160,6 +160,14 @@ where
     if external_factory.is_some_and(|factory| factory.supports_scheme("unix")) {
         schemes = schemes.support("unix", ListenerKind::External);
     }
+    for scheme in ["mqtt", "mqtts"] {
+        if server_protocol.is_some_and(|protocol| protocol.supports_scheme(scheme))
+            && external_factory.is_some_and(|factory| factory.supports_scheme(scheme))
+        {
+            schemes = schemes.support(scheme, ListenerKind::External);
+        }
+        schemes = schemes.disable_ipv6_shadow(scheme);
+    }
     schemes = schemes.disable_ipv6_shadow("faketcp");
 
     let plan = plan_listeners(config.request(self_id), &schemes);

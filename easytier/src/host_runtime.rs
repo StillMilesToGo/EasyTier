@@ -100,6 +100,11 @@ impl ConnectorRuntime for NativeHostRuntime {
             ));
         }
 
+        #[cfg(feature = "mqtt")]
+        if crate::tunnel::mqtt::supports_scheme(url.scheme()) {
+            return crate::tunnel::mqtt::connect(url).await;
+        }
+
         anyhow::bail!("unsupported runtime byte stream: {url}")
     }
 
