@@ -30,6 +30,7 @@ use crate::foundation::time::{Duration, timeout};
 
 use super::{
     peer_conn_liveness::{FEATURE as LIVENESS_ECHO_FEATURE, PeerConnLiveness},
+    peer_conn_obfs::{FEATURE as OBFS_V1_FEATURE, PeerConnObfs},
     peer_conn_ping::PeerConnPinger,
     peer_session::{PeerSession, PeerSessionAction},
 };
@@ -90,6 +91,10 @@ struct NoiseHandshakeResult {
     // the challenge will be sent to authorized peer and compare the proof against it.
     client_secret_proof: Option<SecretProof>,
     remote_features: Vec<String>,
+
+    // Final Noise handshake hash: identical on both ends, never sent on the
+    // wire. Used as the per-link obfuscation key seed.
+    obfs_key_seed: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -280,6 +285,7 @@ pub struct PeerConn {
 
     secure_mode_cfg: Option<SecureModeConfig>,
     session_filter: PeerSessionTunnelFilter,
+    obfs: PeerConnObfs,
     noise_handshake_result: Option<NoiseHandshakeResult>,
 
     #[allow(dead_code)]
@@ -358,8 +364,13 @@ impl PeerConn {
         let peer_conn_tunnel_filter = StatsRecorderTunnelFilter::new();
         let throughput = peer_conn_tunnel_filter.filter_output();
         let liveness = PeerConnLiveness::new();
+        // Obfuscation runs outermost: last on send, first on receive, so it
+        // wraps the fully serialized (and, in secure mode, already encrypted)
+        // peer-manager frame before it reaches the raw tunnel.
+        let obfs = PeerConnObfs::new();
         let filter_chain = TunnelFilterChain::new(session_filter.clone(), peer_conn_tunnel_filter)
-            .chain(liveness.clone());
+            .chain(liveness.clone())
+            .chain(obfs.clone());
         let peer_conn_tunnel = TunnelWithFilter::new(tunnel, filter_chain);
         let mut mpsc_tunnel = MpscTunnel::new(peer_conn_tunnel, Some(Duration::from_secs(7)));
 
@@ -378,6 +389,7 @@ impl PeerConn {
 
             secure_mode_cfg,
             session_filter,
+            obfs,
             noise_handshake_result: None,
 
             tunnel: Arc::new(Mutex::new(
@@ -416,6 +428,33 @@ impl PeerConn {
             .as_ref()
             .map(|cfg| cfg.enabled)
             .unwrap_or(false)
+    }
+
+    /// Features this node advertises in the Noise handshake. Obfuscation is
+    /// offered only in secure mode, where a per-link key seed exists; a peer
+    /// enables it only if it advertises the same feature back.
+    fn local_handshake_features(&self) -> Vec<String> {
+        let mut features = vec![LIVENESS_ECHO_FEATURE.to_owned()];
+        if self.is_secure_mode_enabled() {
+            features.push(OBFS_V1_FEATURE.to_owned());
+        }
+        features
+    }
+
+    /// Settle per-link obfuscation from the completed handshake. Must run after
+    /// `self.info` and any Noise result are in place.
+    fn negotiate_obfs(&self) {
+        let remote_features = self
+            .info
+            .as_ref()
+            .map(|info| info.features.as_slice())
+            .unwrap_or_default();
+        let key_seed = self
+            .noise_handshake_result
+            .as_ref()
+            .map(|noise| noise.obfs_key_seed.as_slice());
+        self.obfs
+            .negotiate(self.is_secure_mode_enabled(), remote_features, key_seed);
     }
 
     // pri, pub
@@ -813,7 +852,7 @@ impl PeerConn {
             a_session_generation,
             a_conn_id: Some(a_conn_id.into()),
             client_encryption_algorithm: self.my_encrypt_algo.clone(),
-            features: vec![LIVENESS_ECHO_FEATURE.to_owned()],
+            features: self.local_handshake_features(),
         };
 
         let mut hs = builder
@@ -960,6 +999,7 @@ impl PeerConn {
             secret_digest,
             client_secret_proof: None,
             remote_features: msg2_pb.features,
+            obfs_key_seed: hs.get_handshake_hash().to_vec(),
         })
     }
 
@@ -1086,7 +1126,7 @@ impl PeerConn {
             a_conn_id_echo: msg1_pb.a_conn_id,
             secret_proof_32,
             server_encryption_algorithm: algo,
-            features: vec![LIVENESS_ECHO_FEATURE.to_owned()],
+            features: self.local_handshake_features(),
         };
         self.send_noise_msg(
             msg2_pb,
@@ -1172,6 +1212,7 @@ impl PeerConn {
                 proof: p.clone(),
             }),
             remote_features: msg1_pb.features,
+            obfs_key_seed: hs.get_handshake_hash().to_vec(),
         })
     }
 
@@ -1240,6 +1281,7 @@ impl PeerConn {
 
         self.liveness
             .set_remote_features(&self.info.as_ref().unwrap().features);
+        self.negotiate_obfs();
 
         if self.get_peer_id() == self.my_peer_id {
             Err(Error::WaitRespError("peer id conflict".to_owned()))
@@ -1271,6 +1313,7 @@ impl PeerConn {
 
         self.liveness
             .set_remote_features(&self.info.as_ref().unwrap().features);
+        self.negotiate_obfs();
 
         if self.get_peer_id() == self.my_peer_id {
             Err(Error::WaitRespError(
