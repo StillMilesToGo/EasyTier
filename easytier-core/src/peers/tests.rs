@@ -170,8 +170,76 @@ async fn peer_conn_noise_handshake_advertises_liveness_echo() {
 
     client_ret.unwrap();
     server_ret.unwrap();
-    assert_eq!(client.get_conn_info().features, ["liveness-echo-v1"]);
-    assert_eq!(server.get_conn_info().features, ["liveness-echo-v1"]);
+    // Secure mode also advertises obfuscation support.
+    assert_eq!(
+        client.get_conn_info().features,
+        ["liveness-echo-v1", "obfs-v1"]
+    );
+    assert_eq!(
+        server.get_conn_info().features,
+        ["liveness-echo-v1", "obfs-v1"]
+    );
+}
+
+#[tokio::test]
+async fn obfuscated_secure_link_round_trips_data() {
+    fn secure_ctx(peer_key: u8) -> Arc<NoopPeerContext> {
+        let private = StaticSecret::from([peer_key; 32]);
+        let public = PublicKey::from(&private);
+        Arc::new(
+            NoopPeerContext::new(NetworkIdentity {
+                network_name: "net".to_owned(),
+                network_secret: Some("secret".to_owned()),
+                network_secret_digest: None,
+            })
+            .with_secure_mode(crate::proto::common::SecureModeConfig {
+                enabled: true,
+                local_private_key: Some(BASE64_STANDARD.encode(private.as_bytes())),
+                local_public_key: Some(BASE64_STANDARD.encode(public.as_bytes())),
+            }),
+        )
+    }
+
+    let (client_tunnel, server_tunnel) = create_ring_tunnel_pair();
+    let mut client = PeerConn::new(
+        1,
+        secure_ctx(1),
+        client_tunnel,
+        Arc::new(PeerSessionStore::new()),
+    );
+    let mut server = PeerConn::new(
+        2,
+        secure_ctx(2),
+        server_tunnel,
+        Arc::new(PeerSessionStore::new()),
+    );
+
+    let (client_ret, server_ret) = tokio::join!(
+        client.do_handshake_as_client(),
+        server.do_handshake_as_server()
+    );
+    client_ret.unwrap();
+    server_ret.unwrap();
+
+    // Both ends offer obfuscation in secure mode, so the link turns it on.
+    assert!(client.get_conn_info().features.iter().any(|f| f == "obfs-v1"));
+    assert!(server.get_conn_info().features.iter().any(|f| f == "obfs-v1"));
+
+    let (client_tx, _client_rx) = create_packet_recv_chan();
+    let (server_tx, mut server_rx) = create_packet_recv_chan();
+    client.start_recv_loop(client_tx).await;
+    server.start_recv_loop(server_tx).await;
+
+    // A data packet must survive wrap -> wire -> unwrap -> AEAD decrypt intact.
+    let mut data = ZCPacket::new_with_payload(b"obfuscated hello");
+    data.fill_peer_manager_hdr(1, 2, PacketType::Data as u8);
+    client.send_msg(data).await.unwrap();
+
+    let received = timeout(Duration::from_secs(1), server_rx.recv())
+        .await
+        .expect("obfuscated data packet did not arrive")
+        .unwrap();
+    assert_eq!(received.payload(), b"obfuscated hello");
 }
 
 #[tokio::test]
