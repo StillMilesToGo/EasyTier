@@ -270,6 +270,12 @@ impl Default for NetworkIdentity {
 pub struct PeerConfig {
     pub uri: url::Url,
     pub peer_public_key: Option<String>,
+    /// Connect only while needed: to join the network, while the peer cannot be
+    /// reached through other peers, or while it lowers the latency to a peer this
+    /// node exchanges data with. Otherwise no direct traffic, heartbeats included,
+    /// flows to the peer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub on_demand: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]

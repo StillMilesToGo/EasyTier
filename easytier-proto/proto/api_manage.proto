@@ -141,6 +141,8 @@ message VpnPortalConfig {
 message NetworkPeerConfig {
   string uri = 1;
   optional string peer_public_key = 2;
+  // connect only while needed, see PeerConfig::on_demand
+  optional bool on_demand = 3;
 }
 
 message PortForwardConfig {

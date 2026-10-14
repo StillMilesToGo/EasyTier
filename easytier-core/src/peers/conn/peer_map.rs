@@ -128,6 +128,31 @@ impl PeerMap {
         self.alive_client_urls.lock().contains_key(url)
     }
 
+    /// Closes the client connections dialed to `url`, returning how many were closed.
+    pub async fn close_client_url_conns(&self, url: &url::Url) -> usize {
+        let conn_ids = self
+            .alive_client_urls
+            .lock()
+            .get(url)
+            .map(|conn_ids| conn_ids.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let peers = self
+            .peer_map
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        let mut closed = 0;
+        for conn_id in conn_ids {
+            for peer in &peers {
+                if peer.close_peer_conn(&conn_id).await.is_ok() {
+                    closed += 1;
+                    break;
+                }
+            }
+        }
+        closed
+    }
+
     pub fn get_peer_by_id(&self, peer_id: PeerId) -> Option<Arc<Peer>> {
         self.peer_map.get(&peer_id).map(|v| v.clone())
     }

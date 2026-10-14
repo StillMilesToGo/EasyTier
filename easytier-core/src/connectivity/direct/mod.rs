@@ -346,6 +346,8 @@ where
                 ) && data.peer_manager.has_recent_traffic(route.peer_id, now);
                 route.peer_id != my_peer_id
                     && (static_allowed || dynamic_allowed)
+                    // an on-demand connector owns the link to these peers
+                    && !data.peer_manager.is_on_demand_peer(route.peer_id)
                     && !data.peer_manager.has_directly_connected_conn(route.peer_id)
                     && !data.peer_blacklist.contains(&route.peer_id)
             })

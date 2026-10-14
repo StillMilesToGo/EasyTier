@@ -251,7 +251,7 @@ mod portable_runtime {
         config::{
             CoreConfig, IpPrefix, NetworkIdentity, ProxyNetworkConfig, gateway::PortForwardConfig,
         },
-        connectivity::manual::{ManualConnectorHost, ManualInterfaceAddrs},
+        connectivity::manual::{ManualConnectorHost, ManualInterfaceAddrs, OnDemandOptions},
         gateway::proxy::wrapped_transport::{
             WrappedTransportEngine, WrappedTransportEngineStart, WrappedTransportEngines,
             WrappedTransportRole,
@@ -3429,6 +3429,123 @@ virtual_ip = "10.82.0.2/24"
                 .contains("inbound-only connectivity does not support outbound peers"),
             "unexpected construction error: {error:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn on_demand_connector_holds_link_only_while_peer_is_unreachable_elsewhere() {
+        async fn wait_until<F, Fut>(what: &str, mut condition: F)
+        where
+            F: FnMut() -> Fut,
+            Fut: std::future::Future<Output = bool>,
+        {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !condition().await {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting until {what}"));
+        }
+
+        async fn has_direct_peer(
+            instance: &CoreInstance<TestHost>,
+            peer_id: crate::config::PeerId,
+        ) -> bool {
+            instance
+                .peer_snapshots()
+                .await
+                .iter()
+                .any(|peer| peer.peer_id == peer_id && !peer.conns.is_empty())
+        }
+
+        async fn has_route(
+            instance: &CoreInstance<TestHost>,
+            peer_id: crate::config::PeerId,
+        ) -> bool {
+            instance
+                .route_snapshots()
+                .await
+                .iter()
+                .any(|route| route.peer_id == peer_id)
+        }
+
+        fn ring_url(instance: &CoreInstance<TestHost>) -> Url {
+            instance
+                .running_listeners()
+                .into_iter()
+                .find(|url| url.scheme() == "ring")
+                .unwrap()
+        }
+
+        let process_runtime = CoreProcessRuntime::new();
+        let build = |configure: &dyn Fn(&mut CoreInstanceConfig)| {
+            let mut config = test_config("on-demand");
+            config.connectivity.listeners = Some(ListenerRuntimeConfig::new(
+                Vec::new(),
+                false,
+                SocketContext::default(),
+            ));
+            configure(&mut config);
+            let (packet_sink, _packet_receiver) = tokio::sync::mpsc::channel(16);
+            CoreInstance::new(
+                config,
+                adapters_with_process_runtime(None, Arc::new(packet_sink), process_runtime.clone()),
+            )
+            .unwrap()
+        };
+
+        // the relay neither opens P2P links itself nor invites them
+        let relay = build(&|config| {
+            config.peer.snapshot.flags.disable_p2p = true;
+            config.peer.snapshot.runtime.feature_flags.disable_p2p = true;
+        });
+        relay.start().await.unwrap();
+        let relay_url = ring_url(&relay);
+        let relay_id = relay.peer_id();
+
+        let bridge = build(&|config| {
+            config.connectivity.initial_peers = vec![relay_url.clone()];
+        });
+        bridge.start().await.unwrap();
+        let bridge_url = ring_url(&bridge);
+
+        let node = build(&|config| {
+            config.connectivity.on_demand_peers = vec![relay_url.clone()];
+            config.connectivity.manual.on_demand = OnDemandOptions {
+                min_connected: Duration::from_secs(1),
+                idle_hold_min: Duration::from_secs(1),
+                idle_hold_max: Duration::from_secs(2),
+                ..Default::default()
+            };
+        });
+        assert!(node.add_connector(relay_url.clone()).is_err());
+        node.start().await.unwrap();
+
+        // nothing else reaches the relay yet, so the node joins through it
+        wait_until("the node bootstraps through the relay", || {
+            has_direct_peer(&node, relay_id)
+        })
+        .await;
+
+        // once the relay is reachable over another link, the direct link is closed
+        node.add_connector(bridge_url).unwrap();
+        wait_until("the node drops its idle relay link", || async {
+            !has_direct_peer(&node, relay_id).await && has_route(&node, relay_id).await
+        })
+        .await;
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(!has_direct_peer(&node, relay_id).await);
+        assert!(has_route(&node, relay_id).await);
+
+        // losing the other path makes the node fall back to the relay
+        bridge.stop().await;
+        wait_until("the node reconnects to the relay", || {
+            has_direct_peer(&node, relay_id)
+        })
+        .await;
+
+        node.stop().await;
+        relay.stop().await;
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 use std::time::{Duration, SystemTime};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::{
         Arc, Weak,
@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use quanta::Instant;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
@@ -449,6 +449,7 @@ pub(crate) async fn close_untrusted_credential_peers<F>(
 
 struct NicPacketProcessor {
     nic_channel: HostPacketSender,
+    activity: PeerActivityTracker,
 }
 
 #[async_trait::async_trait]
@@ -466,6 +467,7 @@ impl PeerPacketFilter for NicPacketProcessor {
                 );
                 return PeerPacketFilterResult::Consumed;
             }
+            self.activity.mark(hdr.from_peer_id.get());
             tracing::trace!(?packet, "send packet to nic channel");
             if let Err(error) = self
                 .nic_channel
@@ -694,12 +696,16 @@ fn append_nic_pipeline(pipeline: &NicPacketPipeline, entry: NicPipelineEntry) {
 async fn init_packet_process_pipeline(
     peer_packet_process_pipeline: &PeerPacketPipeline,
     nic_channel: HostPacketSender,
+    activity: PeerActivityTracker,
     peer_rpc_tspt_sender: UnboundedSender<ZCPacket>,
 ) {
     // for tun/tap ip/eth packet.
     append_peer_pipeline(
         peer_packet_process_pipeline,
-        permanent_peer_pipeline_entry(Box::new(NicPacketProcessor { nic_channel })),
+        permanent_peer_pipeline_entry(Box::new(NicPacketProcessor {
+            nic_channel,
+            activity,
+        })),
     );
 
     // for peer rpc packet
@@ -765,6 +771,7 @@ pub struct PeerManagerCore {
     peer_connection_admission: PeerConnectionAdmission,
     outbound_packet_router: PeerOutboundPacketRouter,
     recent_traffic: RecentTrafficTracker,
+    on_demand_peers: Arc<DashSet<PeerId>>,
     peer_session_store: Arc<PeerSessionStore>,
     encryptor: Arc<dyn Encryptor + 'static>,
     data_compress_algo: CompressorAlgo,
@@ -1138,6 +1145,7 @@ impl PeerManagerCore {
             peer_connection_admission,
             outbound_packet_router,
             recent_traffic,
+            on_demand_peers: Arc::new(DashSet::new()),
             peer_session_store,
             encryptor,
             data_compress_algo,
@@ -1562,6 +1570,85 @@ impl PeerManagerCore {
         }
     }
 
+    /// Starts recording which peers exchange data with this node.
+    pub(crate) fn enable_peer_activity_tracking(&self) {
+        self.recent_traffic.activity().enable();
+    }
+
+    /// Peers that exchanged data with this node within `ttl`.
+    pub(crate) fn active_data_peers(&self, ttl: Duration) -> Vec<PeerId> {
+        self.recent_traffic
+            .activity()
+            .active_peers(Instant::now(), ttl)
+    }
+
+    /// Marks a peer whose direct link is owned by an on-demand connector, so automatic
+    /// P2P neither reopens nor duplicates it.
+    pub(crate) fn set_on_demand_peer(&self, peer_id: PeerId, managed: bool) {
+        if managed {
+            self.on_demand_peers.insert(peer_id);
+        } else {
+            self.on_demand_peers.remove(&peer_id);
+        }
+    }
+
+    pub(crate) fn is_on_demand_peer(&self, peer_id: PeerId) -> bool {
+        self.on_demand_peers.contains(&peer_id)
+    }
+
+    /// Lowest measured latency of the live connections to each directly connected
+    /// peer, in milliseconds. Peers without a latency sample yet are left out.
+    pub(crate) async fn direct_link_latencies_ms(&self) -> BTreeMap<PeerId, i32> {
+        let peer_maps = [
+            self.peers.clone(),
+            self.foreign_network_client.get_peer_map(),
+        ];
+        let mut latencies = BTreeMap::new();
+        for peer_map in &peer_maps {
+            for peer_id in peer_map.list_peers() {
+                let Some(conns) = peer_map.list_peer_conns(peer_id).await else {
+                    continue;
+                };
+                let Some(latency_us) = conns
+                    .iter()
+                    .filter_map(|conn| conn.stats.as_ref().map(|stats| stats.latency_us))
+                    .filter(|latency_us| *latency_us > 0)
+                    .min()
+                else {
+                    continue;
+                };
+                let latency_ms = std::cmp::max(1, (latency_us / 1000) as i32);
+                latencies
+                    .entry(peer_id)
+                    .and_modify(|cur: &mut i32| *cur = (*cur).min(latency_ms))
+                    .or_insert(latency_ms);
+            }
+        }
+        latencies
+    }
+
+    /// Latency-first path costs as if this node's own links were changed by
+    /// `local_links` (`Some(cost)` adds or reprices a link, `None` removes it).
+    pub(crate) fn simulate_local_link_costs(
+        &self,
+        local_links: &BTreeMap<PeerId, Option<i32>>,
+    ) -> BTreeMap<PeerId, usize> {
+        self.route_algo_inst
+            .ospf_route()
+            .map(|route| route.simulate_local_link_costs(local_links))
+            .unwrap_or_default()
+    }
+
+    /// Closes this node's connections dialed to `url`, returning how many were closed.
+    pub(crate) async fn close_client_url_conns(&self, url: &Url) -> usize {
+        self.peers.close_client_url_conns(url).await
+            + self
+                .foreign_network_client
+                .get_peer_map()
+                .close_client_url_conns(url)
+                .await
+    }
+
     pub async fn add_client_tunnel(
         &self,
         tunnel: Box<dyn Tunnel>,
@@ -1847,6 +1934,7 @@ impl PeerManagerCore {
         init_packet_process_pipeline(
             &self.peer_packet_process_pipeline,
             self.nic_channel.clone(),
+            self.recent_traffic.activity().clone(),
             self.peer_rpc_tspt.packet_sender(),
         )
         .await;
@@ -2168,11 +2256,53 @@ fn gc_recent_traffic_entries<F>(
     }
 }
 
+// Data packets refresh a peer's activity at most this often, so the hot path is a
+// shard read lock in the common case.
+const PEER_ACTIVITY_REFRESH: Duration = Duration::from_secs(1);
+
+/// Last data packet sent to or received from each remote peer. Recording stays off
+/// until a consumer (an on-demand connector) enables it.
+#[derive(Clone, Default)]
+pub(crate) struct PeerActivityTracker {
+    enabled: Arc<AtomicBool>,
+    last_seen: Arc<DashMap<PeerId, Instant>>,
+}
+
+impl PeerActivityTracker {
+    pub fn enable(&self) {
+        self.enabled.store(true, Ordering::Release);
+    }
+
+    pub fn mark(&self, peer_id: PeerId) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        let now = Instant::now();
+        if self
+            .last_seen
+            .get(&peer_id)
+            .is_some_and(|last| now.saturating_duration_since(*last) < PEER_ACTIVITY_REFRESH)
+        {
+            return;
+        }
+        self.last_seen.insert(peer_id, now);
+    }
+
+    /// Peers with data within `ttl` of `now`; older entries are dropped.
+    pub fn active_peers(&self, now: Instant, ttl: Duration) -> Vec<PeerId> {
+        self.last_seen
+            .retain(|_, last| now.saturating_duration_since(*last) <= ttl);
+        shrink_dashmap(&self.last_seen, None);
+        self.last_seen.iter().map(|entry| *entry.key()).collect()
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct RecentTrafficTracker {
     my_peer_id: PeerId,
     recent_have_traffic: Arc<DashMap<PeerId, Instant>>,
     p2p_demand_notify: Arc<ExternalTaskSignal>,
+    activity: PeerActivityTracker,
 }
 
 impl RecentTrafficTracker {
@@ -2181,7 +2311,12 @@ impl RecentTrafficTracker {
             my_peer_id,
             recent_have_traffic: Arc::new(DashMap::new()),
             p2p_demand_notify: Arc::new(ExternalTaskSignal::new()),
+            activity: PeerActivityTracker::default(),
         }
+    }
+
+    pub fn activity(&self) -> &PeerActivityTracker {
+        &self.activity
     }
 
     pub fn mark<F>(
@@ -2196,6 +2331,7 @@ impl RecentTrafficTracker {
         if dst_peer_id == self.my_peer_id {
             return;
         }
+        self.activity.mark(dst_peer_id);
 
         if disable_p2p || !lazy_p2p || has_directly_connected_conn(dst_peer_id) {
             return;
@@ -3656,7 +3792,10 @@ mod tests {
             .send(HostPacket::copy_from_payload(b"queued"))
             .await
             .unwrap();
-        let processor = NicPacketProcessor { nic_channel };
+        let processor = NicPacketProcessor {
+            nic_channel,
+            activity: PeerActivityTracker::default(),
+        };
         let mut packet = ZCPacket::new_with_payload(b"next");
         packet.fill_peer_manager_hdr(1, 2, PacketType::Data as u8);
 
@@ -4320,6 +4459,39 @@ mod tests {
         assert!(should_mark_recent_traffic_for_fanout(0));
         assert!(should_mark_recent_traffic_for_fanout(1));
         assert!(!should_mark_recent_traffic_for_fanout(2));
+    }
+
+    #[test]
+    fn peer_activity_is_recorded_only_once_enabled_and_expires() {
+        let tracker = RecentTrafficTracker::new(1);
+        tracker.mark(2, false, false, |_| true);
+        let now = Instant::now();
+        assert!(
+            tracker
+                .activity()
+                .active_peers(now, Duration::from_secs(30))
+                .is_empty()
+        );
+
+        tracker.activity().enable();
+        // recorded regardless of the P2P policy or an existing direct connection
+        tracker.mark(2, true, false, |_| true);
+        tracker.activity().mark(3);
+        // the local peer is never a destination
+        tracker.mark(1, false, false, |_| false);
+        let mut active = tracker
+            .activity()
+            .active_peers(Instant::now(), Duration::from_secs(30));
+        active.sort_unstable();
+        assert_eq!(active, vec![2, 3]);
+
+        let later = Instant::now() + Duration::from_secs(31);
+        assert!(
+            tracker
+                .activity()
+                .active_peers(later, Duration::from_secs(30))
+                .is_empty()
+        );
     }
 
     fn resolved_remote_addr_from_url(addr: Option<&str>) -> Option<ProtoUrl> {

@@ -463,6 +463,74 @@ impl OspfRouteTable {
         self.next_hop_map_version.set_if_larger(version);
     }
 
+    /// Least-cost path costs from `my_peer_id` as if its own links were changed by
+    /// `local_links`: `Some(cost)` adds or reprices the link to that neighbor, `None`
+    /// removes it. Other links keep their calculator cost.
+    fn simulate_path_costs<T: RouteCostCalculatorInterface>(
+        my_peer_id: PeerId,
+        snapshot: &OspfRouteSnapshot,
+        local_links: &BTreeMap<PeerId, Option<i32>>,
+        cost_calc: &T,
+    ) -> BTreeMap<PeerId, usize> {
+        struct LocalLinkCost<'a, T> {
+            my_peer_id: PeerId,
+            local_links: &'a BTreeMap<PeerId, Option<i32>>,
+            inner: &'a T,
+        }
+
+        impl<T: RouteCostCalculatorInterface> RouteCostCalculatorInterface for LocalLinkCost<'_, T> {
+            fn calculate_cost(&self, src: PeerId, dst: PeerId) -> i32 {
+                if src == self.my_peer_id
+                    && let Some(Some(cost)) = self.local_links.get(&dst)
+                {
+                    return (*cost).max(0);
+                }
+                self.inner.calculate_cost(src, dst)
+            }
+        }
+
+        let mut snapshot = snapshot.clone();
+        let self_row = match snapshot
+            .conn_map
+            .iter_mut()
+            .position(|row| row.peer_id == my_peer_id)
+        {
+            Some(idx) => &mut snapshot.conn_map[idx],
+            None => {
+                snapshot.conn_map.push(OspfPeerConnInfo {
+                    peer_id: my_peer_id,
+                    connected_peers: BTreeSet::new(),
+                });
+                snapshot.conn_map.last_mut().unwrap()
+            }
+        };
+        for (peer_id, cost) in local_links {
+            if cost.is_some() {
+                self_row.connected_peers.insert(*peer_id);
+            } else {
+                self_row.connected_peers.remove(peer_id);
+            }
+        }
+
+        let cost_calc = LocalLinkCost {
+            my_peer_id,
+            local_links,
+            inner: cost_calc,
+        };
+        let lookup = snapshot.lookup();
+        let (graph, start_node) =
+            Self::build_peer_graph_from_snapshot(my_peer_id, &snapshot, &lookup, &cost_calc);
+        if graph.node_weight(start_node).is_none() {
+            return BTreeMap::new();
+        }
+
+        dijkstra(&graph, start_node, None, |e| *e.weight())
+            .into_iter()
+            .filter(|(node, _)| *node != start_node)
+            .map(|(node, cost)| (*graph.node_weight(node).unwrap(), cost))
+            .collect()
+    }
+
     pub fn build_from_snapshot<T: RouteCostCalculatorInterface>(
         &self,
         my_peer_id: PeerId,
@@ -4336,6 +4404,20 @@ impl Debug for PeerRoute {
 }
 
 impl PeerRoute {
+    /// Latency-first path costs to every reachable peer as if this node's own links
+    /// were changed by `local_links`. See `OspfRouteTable::simulate_path_costs`.
+    pub(crate) fn simulate_local_link_costs(
+        &self,
+        local_links: &BTreeMap<PeerId, Option<i32>>,
+    ) -> BTreeMap<PeerId, usize> {
+        let snapshot = self.service_impl.local_route_snapshot();
+        let calc_locked = self.service_impl.cost_calculator.read().unwrap();
+        let Some(cost_calc) = calc_locked.as_ref() else {
+            return BTreeMap::new();
+        };
+        OspfRouteTable::simulate_path_costs(self.my_peer_id, &snapshot, local_links, cost_calc)
+    }
+
     pub(crate) async fn withdraw_self_conn_info(&self) -> bool {
         if self.service_impl.stopped.load(Ordering::Acquire) {
             return true;
@@ -6520,5 +6602,70 @@ mod tests {
             table.get_peer_id_for_proxy(&"10.10.1.1".parse::<IpAddr>().unwrap()),
             Some(3)
         );
+    }
+
+    #[test]
+    fn simulates_path_costs_with_changed_local_links() {
+        struct LatencyMap(BTreeMap<(PeerId, PeerId), i32>);
+
+        impl RouteCostCalculatorInterface for LatencyMap {
+            fn calculate_cost(&self, src: PeerId, dst: PeerId) -> i32 {
+                self.0
+                    .get(&(src.min(dst), src.max(dst)))
+                    .copied()
+                    .unwrap_or(500)
+            }
+        }
+
+        // 1 is the local node, 3 a relay it may connect to on demand.
+        let snapshot = OspfRouteSnapshot {
+            peer_infos: vec![peer(1), peer(2), peer(3), peer(4)],
+            conn_map: vec![
+                connected(1, [2]),
+                connected(2, [1, 3, 4]),
+                connected(3, [2, 4]),
+                connected(4, [2, 3]),
+            ],
+            suppressed_peer_ids: BTreeSet::new(),
+            version: 1,
+        };
+        let latencies = LatencyMap(BTreeMap::from([
+            ((1, 2), 10),
+            ((2, 3), 40),
+            ((2, 4), 200),
+            ((3, 4), 20),
+        ]));
+
+        let current =
+            OspfRouteTable::simulate_path_costs(1, &snapshot, &BTreeMap::new(), &latencies);
+        // the longer path through 3 wins on latency
+        assert_eq!(current.get(&4), Some(&70));
+        assert!(!current.contains_key(&1));
+
+        let with_link = OspfRouteTable::simulate_path_costs(
+            1,
+            &snapshot,
+            &BTreeMap::from([(3, Some(15))]),
+            &latencies,
+        );
+        assert_eq!(with_link.get(&3), Some(&15));
+        assert_eq!(with_link.get(&4), Some(&35));
+
+        // a measured latency overrides the calculator cost of an existing link
+        let repriced = OspfRouteTable::simulate_path_costs(
+            1,
+            &snapshot,
+            &BTreeMap::from([(2, Some(100))]),
+            &latencies,
+        );
+        assert_eq!(repriced.get(&4), Some(&160));
+
+        let isolated = OspfRouteTable::simulate_path_costs(
+            1,
+            &snapshot,
+            &BTreeMap::from([(2, None)]),
+            &latencies,
+        );
+        assert!(isolated.is_empty());
     }
 }

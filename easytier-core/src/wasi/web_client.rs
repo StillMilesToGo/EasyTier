@@ -420,10 +420,12 @@ mod tests {
                 NetworkPeerConfig {
                     uri: "tcp://peer.example:11010".to_owned(),
                     peer_public_key: Some("key".to_owned()),
+                    on_demand: None,
                 },
                 NetworkPeerConfig {
                     uri: "quic://peer.example:11010".to_owned(),
                     peer_public_key: None,
+                    on_demand: None,
                 },
             ],
             secure_mode: Some(SecureModeConfig {

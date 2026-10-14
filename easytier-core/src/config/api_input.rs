@@ -208,6 +208,7 @@ fn parse_peer(peer: &manage::NetworkPeerConfig) -> Result<Option<PeerConfig>, an
             .parse()
             .with_context(|| format!("failed to parse peer uri: {}", uri))?,
         peer_public_key: peer.peer_public_key.clone(),
+        on_demand: peer.on_demand.unwrap_or(false),
     }))
 }
 
@@ -233,6 +234,7 @@ fn parse_peer_urls(peer_urls: &[String]) -> Result<Vec<PeerConfig>, anyhow::Erro
                 .parse()
                 .with_context(|| format!("failed to parse peer uri: {}", peer_url))?,
             peer_public_key: None,
+            on_demand: false,
         });
     }
     Ok(peers)
@@ -308,6 +310,7 @@ impl NetworkConfigExt for NetworkConfig {
                             format!("failed to parse public server uri: {}", public_server_url)
                         })?,
                         peer_public_key: None,
+                        on_demand: false,
                     }]);
                 } else {
                     cfg.set_peers(peers);
@@ -587,6 +590,7 @@ impl NetworkConfigExt for NetworkConfig {
                 .map(|p| manage::NetworkPeerConfig {
                     uri: p.uri.to_string(),
                     peer_public_key: p.peer_public_key.clone(),
+                    on_demand: p.on_demand.then_some(true),
                 })
                 .collect();
         }

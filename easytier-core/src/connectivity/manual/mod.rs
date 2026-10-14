@@ -1,7 +1,8 @@
 pub mod discovery;
+mod on_demand;
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{Arc, Mutex, Weak},
@@ -20,6 +21,7 @@ use url::Url;
 
 use crate::tunnel::ring::RingTunnelRegistry;
 use crate::{
+    config::PeerId,
     connectivity::{
         protocol::{ClientProtocolUpgrader, ProtocolTransport, protocol_transport},
         transport::{self, ConnectedByteStream, ConnectedTransport, UdpSessionMode},
@@ -34,6 +36,11 @@ use crate::{
         udp::{UdpBindOptions, VirtualUdpSocketFactory},
     },
     tunnel::{SplitTunnel, Tunnel, TunnelError},
+};
+
+pub use on_demand::OnDemandOptions;
+use on_demand::{
+    ACTIVITY_TTL, DestinationCosts, OnDemandAction, OnDemandInput, OnDemandLink, OnDemandNeed,
 };
 
 const MANUAL_PREFLIGHT_DEFAULT_PORT: u16 = 1000;
@@ -293,6 +300,8 @@ pub struct ManualConnectorOptions {
     pub allow_interface_bind: bool,
     pub tcp_bind: TcpBindOptions,
     pub udp_bind: UdpBindOptions,
+    #[serde(default)]
+    pub on_demand: OnDemandOptions,
 }
 
 impl Default for ManualConnectorOptions {
@@ -305,6 +314,7 @@ impl Default for ManualConnectorOptions {
             allow_interface_bind: true,
             tcp_bind: TcpBindOptions::default(),
             udp_bind: UdpBindOptions::direct_connect(),
+            on_demand: OnDemandOptions::default(),
         }
     }
 }
@@ -343,7 +353,15 @@ struct ManualConnectorState {
     connectors: DashSet<Url>,
     reconnecting: DashSet<Url>,
     removed: DashSet<Url>,
+    // connectors that only stay connected while needed; see `on_demand`
+    on_demand: Mutex<HashMap<Url, OnDemandLink>>,
     state_lock: Mutex<()>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectKind {
+    Persistent,
+    OnDemand,
 }
 
 struct ManualConnectorData<H>
@@ -461,6 +479,9 @@ where
     pub fn add_connector(&self, url: Url) -> anyhow::Result<()> {
         validate_manual_url(&url)?;
         let _state_guard = self.data.state.state_lock.lock().unwrap();
+        if self.data.state.on_demand.lock().unwrap().contains_key(&url) {
+            anyhow::bail!("{url} is already an on-demand connector");
+        }
         self.data.state.removed.remove(&url);
         if !self.data.state.reconnecting.contains(&url) {
             self.data.state.connectors.insert(url);
@@ -468,8 +489,36 @@ where
         Ok(())
     }
 
+    /// Adds a connector that connects only while its peer is needed: to join the
+    /// network, while the peer cannot be reached through other peers, or while a peer
+    /// this node exchanges data with gets a lower latency through it.
+    pub fn add_on_demand_connector(&self, url: Url) -> anyhow::Result<()> {
+        validate_manual_url(&url)?;
+        let _state_guard = self.data.state.state_lock.lock().unwrap();
+        if self.data.state.connectors.contains(&url) || self.data.state.reconnecting.contains(&url)
+        {
+            anyhow::bail!("{url} is already a persistent connector");
+        }
+        if let Some(peer_manager) = self.data.peer_manager.upgrade() {
+            peer_manager.enable_peer_activity_tracking();
+        }
+        self.data
+            .state
+            .on_demand
+            .lock()
+            .unwrap()
+            .entry(url)
+            .or_insert_with(|| OnDemandLink::new(self.data.options.on_demand));
+        Ok(())
+    }
+
     pub fn remove_connector(&self, url: &Url) -> bool {
         let _state_guard = self.data.state.state_lock.lock().unwrap();
+        if let Some(link) = self.data.state.on_demand.lock().unwrap().remove(url) {
+            tracing::warn!(%url, "on-demand connector removed");
+            release_on_demand_peer(&self.data, link.peer_id());
+            return true;
+        }
         if self.data.state.connectors.remove(url).is_some() {
             tracing::warn!(%url, "manual connector removed");
             return true;
@@ -483,6 +532,9 @@ where
 
     pub fn clear_connectors(&self) {
         let _state_guard = self.data.state.state_lock.lock().unwrap();
+        for (_, link) in self.data.state.on_demand.lock().unwrap().drain() {
+            release_on_demand_peer(&self.data, link.peer_id());
+        }
         self.data.state.connectors.clear();
         for url in self.data.state.reconnecting.iter() {
             self.data.state.removed.insert(url.key().clone());
@@ -518,6 +570,30 @@ where
                 status: ManualConnectorStatus::Connecting,
             }
         }));
+        snapshots.extend(
+            self.data
+                .state
+                .on_demand
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(url, link)| {
+                    let status = if link.is_connecting() {
+                        ManualConnectorStatus::Connecting
+                    } else if peer_manager
+                        .as_ref()
+                        .is_some_and(|peer_manager| client_url_is_alive(peer_manager, url))
+                    {
+                        ManualConnectorStatus::Connected
+                    } else {
+                        ManualConnectorStatus::Disconnected
+                    };
+                    ManualConnectorSnapshot {
+                        url: url.clone(),
+                        status,
+                    }
+                }),
+        );
         snapshots
     }
 
@@ -536,7 +612,14 @@ where
                         reconnect_tasks.spawn(async move {
                             let result = reconnect(task_data, url.clone()).await;
                             drop(reservation);
-                            (url, result)
+                            (url, ConnectKind::Persistent, result)
+                        });
+                    }
+                    for url in run_on_demand_policy(&data).await {
+                        let task_data = data.clone();
+                        reconnect_tasks.spawn(async move {
+                            let result = reconnect(task_data, url.clone()).await;
+                            (url, ConnectKind::OnDemand, result)
                         });
                     }
                 }
@@ -545,8 +628,11 @@ where
                         continue;
                     };
                     match result {
-                        Ok((url, reconnect_result)) => {
-                            tracing::warn!(?url, ?reconnect_result, "manual reconnect task done");
+                        Ok((url, kind, reconnect_result)) => {
+                            tracing::warn!(?url, ?kind, ?reconnect_result, "manual reconnect task done");
+                            if kind == ConnectKind::OnDemand {
+                                finish_on_demand_connect(&data, &url, &reconnect_result);
+                            }
                         }
                         Err(error) => {
                             tracing::error!(?error, "manual reconnect task failed");
@@ -561,6 +647,152 @@ where
 
         let _state_guard = data.state.state_lock.lock().unwrap();
         restore_interrupted_connectors(&data.state);
+        for link in data.state.on_demand.lock().unwrap().values_mut() {
+            link.cancel_connect();
+        }
+    }
+}
+
+fn release_on_demand_peer<H>(data: &ManualConnectorData<H>, peer_id: Option<PeerId>)
+where
+    H: ManualConnectorHost,
+{
+    if let (Some(peer_id), Some(peer_manager)) = (peer_id, data.peer_manager.upgrade()) {
+        peer_manager.set_on_demand_peer(peer_id, false);
+    }
+}
+
+/// Evaluates every on-demand connector, closes the links no longer needed and
+/// returns the URLs to connect.
+async fn run_on_demand_policy<H>(data: &ManualConnectorData<H>) -> Vec<Url>
+where
+    H: ManualConnectorHost,
+{
+    let urls = data
+        .state
+        .on_demand
+        .lock()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    if urls.is_empty() {
+        return Vec::new();
+    }
+    let Some(peer_manager) = data.peer_manager.upgrade() else {
+        return Vec::new();
+    };
+
+    let link_latencies = peer_manager.direct_link_latencies_ms().await;
+    let active_peers = peer_manager.active_data_peers(ACTIVITY_TTL);
+    let mut to_connect = Vec::new();
+    for url in urls {
+        let alive = client_url_is_alive(&peer_manager, &url);
+        let now = Instant::now();
+        let Some((peer_id, estimate)) =
+            data.state.on_demand.lock().unwrap().get(&url).map(|link| {
+                let measured = link
+                    .peer_id()
+                    .and_then(|peer_id| link_latencies.get(&peer_id).copied());
+                (link.peer_id(), link.estimate(now, alive, measured))
+            })
+        else {
+            continue;
+        };
+
+        let mut input = OnDemandInput {
+            alive,
+            peer_reachable_elsewhere: false,
+            estimate,
+            destinations: BTreeMap::new(),
+        };
+        if let Some(peer_id) = peer_id {
+            // price this node's other links with their own measurements, which are
+            // fresher than the peer-center view the route uses
+            let mut local_links = link_latencies
+                .iter()
+                .filter(|(link_peer_id, _)| **link_peer_id != peer_id)
+                .map(|(link_peer_id, latency_ms)| (*link_peer_id, Some(*latency_ms)))
+                .collect::<BTreeMap<_, _>>();
+            local_links.insert(peer_id, None);
+            let without_link = peer_manager.simulate_local_link_costs(&local_links);
+            input.peer_reachable_elsewhere = without_link.contains_key(&peer_id);
+
+            let my_peer_id = peer_manager.my_peer_id();
+            let destinations = active_peers
+                .iter()
+                .copied()
+                .filter(|dst| *dst != my_peer_id && *dst != peer_id)
+                .collect::<Vec<_>>();
+            if input.peer_reachable_elsewhere && !destinations.is_empty() {
+                local_links.insert(peer_id, Some(estimate.cost()));
+                let with_link = peer_manager.simulate_local_link_costs(&local_links);
+                input.destinations = destinations
+                    .into_iter()
+                    .map(|dst| {
+                        (
+                            dst,
+                            DestinationCosts {
+                                without_link: without_link.get(&dst).copied(),
+                                with_link: with_link.get(&dst).copied(),
+                            },
+                        )
+                    })
+                    .collect();
+            }
+        }
+
+        let action = match data.state.on_demand.lock().unwrap().get_mut(&url) {
+            Some(link) => link.step(now, &input),
+            None => continue,
+        };
+        match action {
+            OnDemandAction::None => {}
+            OnDemandAction::Connect(need) => {
+                match need {
+                    OnDemandNeed::Bootstrap => {
+                        tracing::info!(%url, ?peer_id, "on-demand connector connecting: peer unreachable through other peers");
+                    }
+                    OnDemandNeed::Latency(dst) | OnDemandNeed::Probe(dst) => {
+                        tracing::info!(%url, ?peer_id, dst, ?need, ?estimate, costs = ?input.destinations.get(&dst), "on-demand connector connecting for a lower latency");
+                    }
+                }
+                to_connect.push(url);
+            }
+            OnDemandAction::Disconnect => {
+                let closed = peer_manager.close_client_url_conns(&url).await;
+                tracing::info!(%url, ?peer_id, closed, "on-demand connector disconnected: link no longer needed");
+            }
+        }
+    }
+    to_connect
+}
+
+fn finish_on_demand_connect<H>(
+    data: &ManualConnectorData<H>,
+    url: &Url,
+    result: &anyhow::Result<PeerId>,
+) where
+    H: ManualConnectorHost,
+{
+    let mut on_demand = data.state.on_demand.lock().unwrap();
+    let Some(link) = on_demand.get_mut(url) else {
+        return;
+    };
+    let previous = link.on_connect_result(
+        Instant::now(),
+        result.as_ref().map(|peer_id| *peer_id).map_err(|_| ()),
+    );
+    let current = link.peer_id();
+    drop(on_demand);
+
+    if let Some(peer_manager) = data.peer_manager.upgrade() {
+        if let Some(previous) = previous {
+            peer_manager.set_on_demand_peer(previous, false);
+        }
+        if let Some(current) = current {
+            peer_manager.set_on_demand_peer(current, true);
+        }
     }
 }
 
@@ -720,7 +952,7 @@ async fn resolve_reconnect_ip_versions(
     Ok(ip_versions)
 }
 
-async fn reconnect<H>(data: Arc<ManualConnectorData<H>>, url: Url) -> anyhow::Result<()>
+async fn reconnect<H>(data: Arc<ManualConnectorData<H>>, url: Url) -> anyhow::Result<PeerId>
 where
     H: ManualConnectorHost,
 {
@@ -767,7 +999,7 @@ where
         )
         .await
         {
-            Ok(()) => return Ok(()),
+            Ok(peer_id) => return Ok(peer_id),
             Err(error) => {
                 emit_connect_error(&data, &url, ip_version, &error);
                 last_error = error;
@@ -783,7 +1015,7 @@ async fn reconnect_with_ip_version<H>(
     ip_version: IpVersion,
     started_at: Instant,
     connect_timeout: Duration,
-) -> anyhow::Result<()>
+) -> anyhow::Result<PeerId>
 where
     H: ManualConnectorHost,
 {
@@ -897,7 +1129,7 @@ where
         })
         .await?;
     tracing::info!(peer_id, %conn_id, %requested_url, "manual reconnect succeeded");
-    Ok(())
+    Ok(peer_id)
 }
 
 pub(crate) async fn connect_resolved<H>(

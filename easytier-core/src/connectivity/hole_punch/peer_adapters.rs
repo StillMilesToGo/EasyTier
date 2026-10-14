@@ -43,6 +43,8 @@ impl UdpHolePunchPeerSource for PeerManagerCore {
         self.list_route_snapshots()
             .await
             .into_iter()
+            // an on-demand connector owns the link to these peers
+            .filter(|route| !self.is_on_demand_peer(route.peer_id))
             .filter_map(|route| {
                 let udp_nat_type = route
                     .stun_info
@@ -144,6 +146,8 @@ impl TcpHolePunchPeerSource for PeerManagerCore {
         self.list_route_snapshots()
             .await
             .into_iter()
+            // an on-demand connector owns the link to these peers
+            .filter(|route| !self.is_on_demand_peer(route.peer_id))
             .map(|route| TcpPunchCandidate {
                 peer_id: route.peer_id,
                 tcp_nat_type: route

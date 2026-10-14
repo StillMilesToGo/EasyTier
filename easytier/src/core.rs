@@ -232,6 +232,15 @@ struct NetworkOptions {
     peers: Vec<String>,
 
     #[arg(
+        long,
+        env = "ET_ON_DEMAND_PEERS",
+        value_delimiter = ',',
+        help = t!("core_clap.on_demand_peers").to_string(),
+        num_args = 0..
+    )]
+    on_demand_peers: Vec<String>,
+
+    #[arg(
         short,
         long,
         env = "ET_EXTERNAL_NODE",
@@ -718,15 +727,21 @@ impl NetworkOptions {
             })?));
         }
 
-        if !self.peers.is_empty() {
+        if !self.peers.is_empty() || !self.on_demand_peers.is_empty() {
             let mut peers = cfg.get_peers();
-            peers.reserve(peers.len() + self.peers.len());
-            for p in &self.peers {
+            peers.reserve(peers.len() + self.peers.len() + self.on_demand_peers.len());
+            let cli_peers = self
+                .peers
+                .iter()
+                .map(|p| (p, false))
+                .chain(self.on_demand_peers.iter().map(|p| (p, true)));
+            for (p, on_demand) in cli_peers {
                 peers.push(PeerConfig {
                     uri: p
                         .parse()
                         .with_context(|| format!("failed to parse peer uri: {}", p))?,
                     peer_public_key: None,
+                    on_demand,
                 });
             }
             cfg.set_peers(peers);
@@ -764,6 +779,7 @@ impl NetworkOptions {
                     format!("failed to parse external node uri: {}", external_nodes)
                 })?,
                 peer_public_key: None,
+                on_demand: false,
             });
             cfg.set_peers(old_peers);
         }
@@ -1917,6 +1933,34 @@ tcp_stun_servers = ["tcp.example.com:3478"]
         assert_eq!(cfg.get_stun_servers(), Some(Vec::new()));
         assert_eq!(cfg.get_stun_servers_v6(), Some(Vec::new()));
         assert_eq!(cfg.get_tcp_stun_servers(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn on_demand_peers_cli_marks_peers_on_demand() {
+        let cli = Cli::try_parse_from([
+            "easytier-core",
+            "-p",
+            "tcp://10.0.0.2:11010",
+            "--on-demand-peers",
+            "tcp://relay.example.com:11010,udp://relay.example.com:11010",
+        ])
+        .unwrap();
+        let cfg = TomlConfigLoader::default();
+        cli.network_options.merge_into(&cfg).unwrap();
+
+        let peers = cfg
+            .get_peers()
+            .into_iter()
+            .map(|peer| (peer.uri.to_string(), peer.on_demand))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            peers,
+            vec![
+                ("tcp://10.0.0.2:11010".to_owned(), false),
+                ("tcp://relay.example.com:11010".to_owned(), true),
+                ("udp://relay.example.com:11010".to_owned(), true),
+            ]
+        );
     }
 
     #[test]

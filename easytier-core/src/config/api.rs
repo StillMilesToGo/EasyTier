@@ -52,6 +52,7 @@ pub fn network_config_from_toml(config: &TomlConfig) -> NetworkConfig {
             .map(|peer| manage::NetworkPeerConfig {
                 uri: peer.uri.to_string(),
                 peer_public_key: peer.peer_public_key.clone(),
+                on_demand: peer.on_demand.then_some(true),
             })
             .collect();
     }

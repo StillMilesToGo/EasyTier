@@ -191,6 +191,9 @@ pub enum CoreConnectivityMode {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CoreConnectivityConfig {
     pub initial_peers: Vec<Url>,
+    /// Peers connected only while needed; see `ManualConnectorManager::add_on_demand_connector`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub on_demand_peers: Vec<Url>,
     pub listeners: Option<ListenerRuntimeConfig>,
     pub runtime: CoreRuntimeConfig,
     #[serde(default, skip_serializing_if = "CoreInstanceStartupPlan::is_default")]
@@ -608,6 +611,7 @@ where
         let protected_tcp_ports = process_runtime.protected_tcp_ports();
         let CoreConnectivityConfig {
             initial_peers,
+            on_demand_peers,
             listeners: _,
             runtime: _,
             startup_plan,
@@ -618,7 +622,9 @@ where
         } = config;
         #[cfg(not(feature = "proxy-packet"))]
         let _ = startup_plan;
-        if connectivity_mode == CoreConnectivityMode::InboundOnly && !initial_peers.is_empty() {
+        if connectivity_mode == CoreConnectivityMode::InboundOnly
+            && (!initial_peers.is_empty() || !on_demand_peers.is_empty())
+        {
             anyhow::bail!("inbound-only connectivity does not support outbound peers");
         }
         let accepted_tunnel_handler = PeerAcceptedTunnelHandler::new(&peer_manager, events.clone());
@@ -711,6 +717,9 @@ where
             );
             for url in initial_peers {
                 manual.add_connector(url)?;
+            }
+            for url in on_demand_peers {
+                manual.add_on_demand_connector(url)?;
             }
             Some(manual)
         } else {

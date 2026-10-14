@@ -351,7 +351,16 @@ impl CoreInstanceConfig {
                         .collect(),
                 }),
             connectivity: CoreConnectivityConfig {
-                initial_peers: peers.into_iter().map(|peer| peer.uri).collect(),
+                initial_peers: peers
+                    .iter()
+                    .filter(|peer| !peer.on_demand)
+                    .map(|peer| peer.uri.clone())
+                    .collect(),
+                on_demand_peers: peers
+                    .into_iter()
+                    .filter(|peer| peer.on_demand)
+                    .map(|peer| peer.uri)
+                    .collect(),
                 listeners,
                 runtime,
                 startup_plan: super::CoreInstanceStartupPlan {
@@ -577,6 +586,41 @@ disable_p2p = true
             1
         );
         assert!(normalized.peer.snapshot.flags.disable_p2p);
+    }
+
+    #[test]
+    fn on_demand_peers_are_split_from_initial_peers() {
+        let config = TomlConfig::new_from_str(
+            r#"
+[[peer]]
+uri = "tcp://10.0.0.2:11010"
+
+[[peer]]
+uri = "tcp://relay.example.com:11010"
+on_demand = true
+
+[network_identity]
+network_name = "on-demand"
+network_secret = "secret"
+"#,
+        )
+        .unwrap();
+        assert!(config.get_peers()[1].on_demand);
+
+        let normalized = CoreInstanceConfig::from_toml(&config).unwrap();
+        assert_eq!(
+            normalized.connectivity.initial_peers,
+            vec!["tcp://10.0.0.2:11010".parse::<url::Url>().unwrap()]
+        );
+        assert_eq!(
+            normalized.connectivity.on_demand_peers,
+            vec!["tcp://relay.example.com:11010".parse::<url::Url>().unwrap()]
+        );
+
+        // the flag survives a TOML round trip and is omitted when unset
+        let dumped = config.dump();
+        assert_eq!(dumped.matches("on_demand = true").count(), 1);
+        assert!(!dumped.contains("on_demand = false"));
     }
 
     #[test]
