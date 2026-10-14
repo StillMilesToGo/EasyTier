@@ -23,8 +23,9 @@
 //! negotiation is per hop, a mesh can mix obfuscated and legacy links freely.
 //!
 //! This is obfuscation, not an extra security layer: confidentiality and
-//! integrity still come from the inner secure-datagram AEAD. Handshake packets
-//! are never obfuscated, since they are exchanged before both ends enable it.
+//! integrity still come from the inner secure-datagram AEAD. The link's own
+//! handshake packets are never obfuscated, since they are exchanged before both
+//! ends enable it; everything sent afterwards is.
 
 use std::sync::Arc;
 
@@ -32,13 +33,18 @@ use arc_swap::ArcSwapOption;
 use rand::{Rng, RngCore, SeedableRng, rngs::StdRng, thread_rng};
 use sha2::{Digest, Sha256};
 
-use crate::packet::{PacketType, ZCPacket};
+use crate::packet::{PEER_MANAGER_HEADER_SIZE, PacketType, ZCPacket};
 use crate::tunnel::{SinkItem, StreamItem, filter::TunnelFilter};
 
 /// Feature string advertised in the handshake. Present only when the local
 /// node both runs secure mode and supports obfuscation, so observing it on a
 /// link implies mutual agreement.
-pub(super) const FEATURE: &str = "obfs-v1";
+///
+/// `obfs-v1` builds left forwarded relay handshakes unwrapped while still
+/// unwrapping every received frame, which corrupted those handshakes at each
+/// obfuscated hop. A v1 build and this one share no feature, so a link between
+/// them stays legacy instead of mixing the two behaviours.
+pub(super) const FEATURE: &str = "obfs-v2";
 
 /// Domain separator so the obfuscation key can never collide with any other
 /// key derived from the same handshake material.
@@ -143,14 +149,19 @@ fn apply_keystream(key: &[u8; 32], nonce: &[u8; NONCE_LEN], data: &mut [u8]) {
     }
 }
 
-/// Handshake-class packets must never be obfuscated. They are exchanged
-/// before both ends have obfuscation on, and — because the outbound sink is
-/// asynchronous — one can still be in the send queue when this side flips
-/// obfuscation on at the end of its own handshake. The peer parses them with
-/// the legacy format, so wrapping them would break the connection before it is
-/// established. By the time steady-state traffic (data, ping, control) flows,
-/// both ends are enabled, so skipping only these types is safe.
-fn is_bootstrap_packet(pkt: &ZCPacket) -> bool {
+/// The link's own handshake packets must never be obfuscated. They are
+/// exchanged before both ends have obfuscation on, and — because the outbound
+/// sink is asynchronous — one can still be in the send queue when this side
+/// flips obfuscation on at the end of its own handshake. The peer parses them
+/// with the legacy format, so wrapping them would break the connection before
+/// it is established. By the time steady-state traffic (data, ping, control)
+/// flows, both ends are enabled, so skipping only these types is safe.
+///
+/// Relay handshakes are not on this list: they set up end-to-end sessions
+/// between other nodes and are forwarded over links that finished their own
+/// handshake long ago. The receiver cannot see a frame's type under the mask
+/// and unwraps every frame, so they must be wrapped like any other traffic.
+fn is_link_handshake_packet(pkt: &ZCPacket) -> bool {
     let Some(hdr) = pkt.peer_manager_header() else {
         return true;
     };
@@ -159,8 +170,6 @@ fn is_bootstrap_packet(pkt: &ZCPacket) -> bool {
         || t == PacketType::NoiseHandshakeMsg2 as u8
         || t == PacketType::NoiseHandshakeMsg3 as u8
         || t == PacketType::HandShake as u8
-        || t == PacketType::RelayHandshake as u8
-        || t == PacketType::RelayHandshakeAck as u8
 }
 
 fn choose_pad_len(payload_len: usize) -> usize {
@@ -222,10 +231,16 @@ impl PeerConnObfs {
         apply_keystream(key, &nonce, &mut buf[start..region_end]);
 
         let pad_len = buf[region_end - 1] as usize;
-        if region_end - start < 1 + pad_len {
+        // A frame the peer did not wrap unmasks to noise. Noise too short to
+        // hold a peer-manager header would make the receive loop close the
+        // whole link, so such a frame is dropped here instead.
+        let Some(restored_len) = (region_end - 1).checked_sub(pad_len) else {
+            return false;
+        };
+        if restored_len < start + PEER_MANAGER_HEADER_SIZE {
             return false;
         }
-        buf.truncate(region_end - 1 - pad_len);
+        buf.truncate(restored_len);
         true
     }
 }
@@ -235,7 +250,7 @@ impl TunnelFilter for PeerConnObfs {
 
     fn before_send(&self, mut data: SinkItem) -> Option<SinkItem> {
         if let Some(key) = self.inner.key.load().as_deref()
-            && !is_bootstrap_packet(&data)
+            && !is_link_handshake_packet(&data)
         {
             self.wrap(key, &mut data);
         }
@@ -263,7 +278,7 @@ impl TunnelFilter for PeerConnObfs {
 mod tests {
     use super::{FEATURE, FIXED_OVERHEAD, PeerConnObfs};
     use crate::{
-        packet::{PacketType, ZCPacket, ZCPacketType},
+        packet::{PEER_MANAGER_HEADER_SIZE, PacketType, ZCPacket, ZCPacketType},
         tunnel::filter::TunnelFilter,
     };
 
@@ -350,7 +365,10 @@ mod tests {
             // The raw tunnel would serialize it as a UDP frame; mimic that.
             let on_wire = sent.convert_type(ZCPacketType::UDP);
             let received = b.after_received(Ok(on_wire)).unwrap().unwrap();
-            assert_eq!(received.tunnel_payload(), expected_tunnel_payload.as_slice());
+            assert_eq!(
+                received.tunnel_payload(),
+                expected_tunnel_payload.as_slice()
+            );
             assert_eq!(
                 received.peer_manager_header().unwrap().packet_type,
                 PacketType::Data as u8
@@ -378,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn handshake_packets_are_never_obfuscated() {
+    fn link_handshake_packets_are_never_obfuscated() {
         let (a, _b) = enabled_pair();
         for ty in [
             PacketType::NoiseHandshakeMsg1,
@@ -396,6 +414,52 @@ mod tests {
                 "{ty:?} must pass through unobfuscated during bootstrap"
             );
         }
+    }
+
+    #[test]
+    fn relay_handshakes_cross_an_obfuscated_link_intact() {
+        // Relay handshakes are end-to-end packets that other nodes forward over
+        // links that are already obfuscated, and the receiver unwraps every
+        // frame on such a link. Left in clear, they reach the next hop as noise.
+        let (a, b) = enabled_pair();
+        for ty in [PacketType::RelayHandshake, PacketType::RelayHandshakeAck] {
+            let mut pkt = ZCPacket::new_with_payload(&[0x42u8; 160]);
+            pkt.fill_peer_manager_hdr(1, 3, ty as u8);
+            let expected = pkt.tunnel_payload().to_vec();
+
+            let sent = a.before_send(pkt).unwrap();
+            assert_ne!(
+                sent.tunnel_payload(),
+                expected.as_slice(),
+                "{ty:?} left in clear"
+            );
+
+            let on_wire = sent.convert_type(ZCPacketType::UDP);
+            let received = b.after_received(Ok(on_wire)).unwrap().unwrap();
+            assert_eq!(
+                received.tunnel_payload(),
+                expected.as_slice(),
+                "{ty:?} garbled"
+            );
+        }
+    }
+
+    #[test]
+    fn a_frame_that_unwraps_shorter_than_a_header_is_dropped() {
+        // The peer-conn receive loop closes the link on a frame without a
+        // peer-manager header, so such a frame must never leave the filter.
+        let (a, b) = enabled_pair();
+        let mut pkt = data_packet(b"");
+        let start = pkt
+            .packet_type()
+            .get_packet_offsets()
+            .peer_manager_header_offset;
+        pkt.mut_inner()
+            .truncate(start + PEER_MANAGER_HEADER_SIZE - 1);
+        a.wrap(&a.key().unwrap(), &mut pkt);
+
+        let on_wire = pkt.convert_type(ZCPacketType::UDP);
+        assert!(b.after_received(Ok(on_wire)).is_none());
     }
 
     #[test]

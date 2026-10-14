@@ -3431,52 +3431,49 @@ virtual_ip = "10.82.0.2/24"
         );
     }
 
+    async fn wait_until<F, Fut>(what: &str, mut condition: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !condition().await {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting until {what}"));
+    }
+
+    async fn has_direct_peer(
+        instance: &CoreInstance<TestHost>,
+        peer_id: crate::config::PeerId,
+    ) -> bool {
+        instance
+            .peer_snapshots()
+            .await
+            .iter()
+            .any(|peer| peer.peer_id == peer_id && !peer.conns.is_empty())
+    }
+
+    async fn has_route(instance: &CoreInstance<TestHost>, peer_id: crate::config::PeerId) -> bool {
+        instance
+            .route_snapshots()
+            .await
+            .iter()
+            .any(|route| route.peer_id == peer_id)
+    }
+
+    fn ring_url(instance: &CoreInstance<TestHost>) -> Url {
+        instance
+            .running_listeners()
+            .into_iter()
+            .find(|url| url.scheme() == "ring")
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn on_demand_connector_holds_link_only_while_peer_is_unreachable_elsewhere() {
-        async fn wait_until<F, Fut>(what: &str, mut condition: F)
-        where
-            F: FnMut() -> Fut,
-            Fut: std::future::Future<Output = bool>,
-        {
-            tokio::time::timeout(Duration::from_secs(30), async {
-                while !condition().await {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            })
-            .await
-            .unwrap_or_else(|_| panic!("timed out waiting until {what}"));
-        }
-
-        async fn has_direct_peer(
-            instance: &CoreInstance<TestHost>,
-            peer_id: crate::config::PeerId,
-        ) -> bool {
-            instance
-                .peer_snapshots()
-                .await
-                .iter()
-                .any(|peer| peer.peer_id == peer_id && !peer.conns.is_empty())
-        }
-
-        async fn has_route(
-            instance: &CoreInstance<TestHost>,
-            peer_id: crate::config::PeerId,
-        ) -> bool {
-            instance
-                .route_snapshots()
-                .await
-                .iter()
-                .any(|route| route.peer_id == peer_id)
-        }
-
-        fn ring_url(instance: &CoreInstance<TestHost>) -> Url {
-            instance
-                .running_listeners()
-                .into_iter()
-                .find(|url| url.scheme() == "ring")
-                .unwrap()
-        }
-
         let process_runtime = CoreProcessRuntime::new();
         let build = |configure: &dyn Fn(&mut CoreInstanceConfig)| {
             let mut config = test_config("on-demand");
@@ -3546,6 +3543,74 @@ virtual_ip = "10.82.0.2/24"
 
         node.stop().await;
         relay.stop().await;
+    }
+
+    #[tokio::test]
+    async fn secure_relay_session_crosses_obfuscated_links() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let process_runtime = CoreProcessRuntime::new();
+        let build = |key: u8, initial_peers: Vec<Url>| {
+            let mut config = test_config("secure-relay");
+            config.connectivity.listeners = Some(ListenerRuntimeConfig::new(
+                Vec::new(),
+                false,
+                SocketContext::default(),
+            ));
+            config.connectivity.initial_peers = initial_peers;
+            // the two ends must only meet through the middle node
+            config.peer.snapshot.flags.disable_p2p = true;
+            config.peer.snapshot.runtime.feature_flags.disable_p2p = true;
+            let private = StaticSecret::from([key; 32]);
+            let public = PublicKey::from(&private);
+            config.peer.snapshot.runtime.secure_mode =
+                Some(crate::proto::common::SecureModeConfig {
+                    enabled: true,
+                    local_private_key: Some(BASE64_STANDARD.encode(private.as_bytes())),
+                    local_public_key: Some(BASE64_STANDARD.encode(public.as_bytes())),
+                });
+            let (packet_sink, _packet_receiver) = tokio::sync::mpsc::channel(16);
+            CoreInstance::new(
+                config,
+                adapters_with_process_runtime(None, Arc::new(packet_sink), process_runtime.clone()),
+            )
+            .unwrap()
+        };
+
+        let middle = build(1, Vec::new());
+        middle.start().await.unwrap();
+        let middle_url = ring_url(&middle);
+        let left = build(2, vec![middle_url.clone()]);
+        left.start().await.unwrap();
+        let right = build(3, vec![middle_url]);
+        right.start().await.unwrap();
+        let right_id = right.peer_id();
+
+        wait_until("the ends learn a route to each other", || {
+            has_route(&left, right_id)
+        })
+        .await;
+
+        // Both links are obfuscated, so the handshake for the end-to-end
+        // session is wrapped and unwrapped at every hop on its way across.
+        let relay_peer_map = left.peer_manager().get_relay_peer_map();
+        wait_until("the ends establish a relay session", || {
+            let relay_peer_map = relay_peer_map.clone();
+            async move {
+                relay_peer_map
+                    .ensure_session(right_id, crate::peers::route::NextHopPolicy::LeastHop)
+                    .await
+                    .is_ok()
+            }
+        })
+        .await;
+        assert!(has_direct_peer(&left, middle.peer_id()).await);
+        assert!(has_direct_peer(&right, middle.peer_id()).await);
+
+        left.stop().await;
+        right.stop().await;
+        middle.stop().await;
     }
 
     #[tokio::test]

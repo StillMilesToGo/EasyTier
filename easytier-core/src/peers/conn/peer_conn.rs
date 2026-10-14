@@ -30,7 +30,7 @@ use crate::foundation::time::{Duration, timeout};
 
 use super::{
     peer_conn_liveness::{FEATURE as LIVENESS_ECHO_FEATURE, PeerConnLiveness},
-    peer_conn_obfs::{FEATURE as OBFS_V1_FEATURE, PeerConnObfs},
+    peer_conn_obfs::{FEATURE as OBFS_FEATURE, PeerConnObfs},
     peer_conn_ping::PeerConnPinger,
     peer_session::{PeerSession, PeerSessionAction},
 };
@@ -436,7 +436,7 @@ impl PeerConn {
     fn local_handshake_features(&self) -> Vec<String> {
         let mut features = vec![LIVENESS_ECHO_FEATURE.to_owned()];
         if self.is_secure_mode_enabled() {
-            features.push(OBFS_V1_FEATURE.to_owned());
+            features.push(OBFS_FEATURE.to_owned());
         }
         features
     }

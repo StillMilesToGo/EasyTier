@@ -173,11 +173,11 @@ async fn peer_conn_noise_handshake_advertises_liveness_echo() {
     // Secure mode also advertises obfuscation support.
     assert_eq!(
         client.get_conn_info().features,
-        ["liveness-echo-v1", "obfs-v1"]
+        ["liveness-echo-v1", "obfs-v2"]
     );
     assert_eq!(
         server.get_conn_info().features,
-        ["liveness-echo-v1", "obfs-v1"]
+        ["liveness-echo-v1", "obfs-v2"]
     );
 }
 
@@ -222,8 +222,20 @@ async fn obfuscated_secure_link_round_trips_data() {
     server_ret.unwrap();
 
     // Both ends offer obfuscation in secure mode, so the link turns it on.
-    assert!(client.get_conn_info().features.iter().any(|f| f == "obfs-v1"));
-    assert!(server.get_conn_info().features.iter().any(|f| f == "obfs-v1"));
+    assert!(
+        client
+            .get_conn_info()
+            .features
+            .iter()
+            .any(|f| f == "obfs-v2")
+    );
+    assert!(
+        server
+            .get_conn_info()
+            .features
+            .iter()
+            .any(|f| f == "obfs-v2")
+    );
 
     let (client_tx, _client_rx) = create_packet_recv_chan();
     let (server_tx, mut server_rx) = create_packet_recv_chan();
@@ -240,6 +252,74 @@ async fn obfuscated_secure_link_round_trips_data() {
         .expect("obfuscated data packet did not arrive")
         .unwrap();
     assert_eq!(received.payload(), b"obfuscated hello");
+}
+
+#[tokio::test]
+async fn obfuscated_link_forwards_relay_handshakes_intact() {
+    fn secure_ctx(peer_key: u8) -> Arc<NoopPeerContext> {
+        let private = StaticSecret::from([peer_key; 32]);
+        let public = PublicKey::from(&private);
+        Arc::new(
+            NoopPeerContext::new(NetworkIdentity {
+                network_name: "net".to_owned(),
+                network_secret: Some("secret".to_owned()),
+                network_secret_digest: None,
+            })
+            .with_secure_mode(crate::proto::common::SecureModeConfig {
+                enabled: true,
+                local_private_key: Some(BASE64_STANDARD.encode(private.as_bytes())),
+                local_public_key: Some(BASE64_STANDARD.encode(public.as_bytes())),
+            }),
+        )
+    }
+
+    let (client_tunnel, server_tunnel) = create_ring_tunnel_pair();
+    let mut client = PeerConn::new(
+        1,
+        secure_ctx(1),
+        client_tunnel,
+        Arc::new(PeerSessionStore::new()),
+    );
+    let mut server = PeerConn::new(
+        2,
+        secure_ctx(2),
+        server_tunnel,
+        Arc::new(PeerSessionStore::new()),
+    );
+    let (client_ret, server_ret) = tokio::join!(
+        client.do_handshake_as_client(),
+        server.do_handshake_as_server()
+    );
+    client_ret.unwrap();
+    server_ret.unwrap();
+
+    let (client_tx, _client_rx) = create_packet_recv_chan();
+    let (server_tx, mut server_rx) = create_packet_recv_chan();
+    client.start_recv_loop(client_tx).await;
+    server.start_recv_loop(server_tx).await;
+
+    // A relay handshake between two other nodes, forwarded over this link as an
+    // intermediate hop would. Each one must arrive exactly as it was sent.
+    for (i, ty) in [PacketType::RelayHandshake, PacketType::RelayHandshakeAck]
+        .into_iter()
+        .cycle()
+        .take(64)
+        .enumerate()
+    {
+        let body = vec![i as u8; 96 + i];
+        let mut handshake = ZCPacket::new_with_payload(&body);
+        handshake.fill_peer_manager_hdr(3, 4, ty as u8);
+        client.send_msg(handshake).await.unwrap();
+
+        let received = timeout(Duration::from_secs(1), server_rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("forwarded {ty:?} #{i} did not arrive"))
+            .unwrap_or_else(|| panic!("link closed by forwarded {ty:?} #{i}"));
+        let hdr = received.peer_manager_header().unwrap();
+        assert_eq!(hdr.packet_type, ty as u8, "forwarded {ty:?} #{i} garbled");
+        assert_eq!((hdr.from_peer_id.get(), hdr.to_peer_id.get()), (3, 4));
+        assert_eq!(received.payload(), body.as_slice());
+    }
 }
 
 #[tokio::test]
