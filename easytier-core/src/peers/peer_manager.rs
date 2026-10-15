@@ -39,6 +39,7 @@ use crate::{
     },
     proto::common::{Flags, PeerFeatureFlag, StunInfo, Url as ProtoUrl},
     proto::core_peer::peer::{ListPublicIpv6InfoResponse, PeerConnInfo, Route as CoreRoute},
+    rpc::service_registry::ServiceAccessFilter,
     tunnel::{
         Tunnel,
         encrypt::{
@@ -987,6 +988,11 @@ impl PeerManagerCore {
             rpc_tspt.clone(),
             stats_manager.clone(),
         ));
+        let on_demand_peers = Arc::new(DashSet::new());
+        peer_rpc_mgr
+            .rpc_server()
+            .registry()
+            .set_access_filter(Some(on_demand_peer_rpc_filter(on_demand_peers.clone())));
 
         let route_algo_inst = RouteAlgoInst::new(
             route_algo,
@@ -1105,6 +1111,7 @@ impl PeerManagerCore {
             foreign_network_manager.clone(),
             peer_session_store.clone(),
             recent_traffic.clone(),
+            on_demand_peers.clone(),
         );
         let route = route_algo_inst.route_arc();
         let outbound_packet_router = PeerOutboundPacketRouter::new(
@@ -1145,7 +1152,7 @@ impl PeerManagerCore {
             peer_connection_admission,
             outbound_packet_router,
             recent_traffic,
-            on_demand_peers: Arc::new(DashSet::new()),
+            on_demand_peers,
             peer_session_store,
             encryptor,
             data_compress_algo,
@@ -1596,6 +1603,12 @@ impl PeerManagerCore {
         self.on_demand_peers.contains(&peer_id)
     }
 
+    /// Closes the connections to `peer_id` this node's configuration did not ask for,
+    /// returning how many were closed.
+    pub(crate) async fn close_unconfigured_conns(&self, peer_id: PeerId) -> usize {
+        self.peers.close_unconfigured_conns(peer_id).await
+    }
+
     /// Lowest measured latency of the live connections to each directly connected
     /// peer, in milliseconds. Peers without a latency sample yet are left out.
     pub(crate) async fn direct_link_latencies_ms(&self) -> BTreeMap<PeerId, i32> {
@@ -2015,6 +2028,27 @@ pub(crate) async fn close_peer_conn(
     ret
 }
 
+/// Refuses on-demand peers the services they would use to open a P2P link to this
+/// node, as if those services were not offered. The link to such a peer belongs to its
+/// on-demand connector, and a missing service makes the peer stop asking for an hour.
+fn on_demand_peer_rpc_filter(on_demand_peers: Arc<DashSet<PeerId>>) -> ServiceAccessFilter {
+    use crate::proto::{
+        peer_rpc::{
+            DirectConnectorRpcDescriptor, TcpHolePunchRpcDescriptor, UdpHolePunchRpcDescriptor,
+        },
+        rpc_types::descriptor::ServiceDescriptor as _,
+    };
+    let p2p_services = [
+        DirectConnectorRpcDescriptor.name(),
+        UdpHolePunchRpcDescriptor.name(),
+        TcpHolePunchRpcDescriptor.name(),
+    ];
+    Arc::new(move |caller, service| {
+        !(on_demand_peers.contains(&caller)
+            && p2p_services.contains(&service.service_name.as_str()))
+    })
+}
+
 pub(crate) struct PeerConnectionAdmission {
     my_peer_id: PeerId,
     context: ArcPeerContext,
@@ -2023,10 +2057,12 @@ pub(crate) struct PeerConnectionAdmission {
     foreign_network_manager: Arc<ForeignNetworkManager>,
     peer_session_store: Arc<PeerSessionStore>,
     recent_traffic: RecentTrafficTracker,
+    on_demand_peers: Arc<DashSet<PeerId>>,
     reserved_my_peer_id_map: DashMap<String, PeerId>,
 }
 
 impl PeerConnectionAdmission {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         my_peer_id: PeerId,
         context: ArcPeerContext,
@@ -2035,6 +2071,7 @@ impl PeerConnectionAdmission {
         foreign_network_manager: Arc<ForeignNetworkManager>,
         peer_session_store: Arc<PeerSessionStore>,
         recent_traffic: RecentTrafficTracker,
+        on_demand_peers: Arc<DashSet<PeerId>>,
     ) -> Self {
         Self {
             my_peer_id,
@@ -2044,8 +2081,25 @@ impl PeerConnectionAdmission {
             foreign_network_manager,
             peer_session_store,
             recent_traffic,
+            on_demand_peers,
             reserved_my_peer_id_map: DashMap::new(),
         }
+    }
+
+    /// Refuses a link to an on-demand peer that this node's configuration did not ask
+    /// for: that link belongs to the peer's on-demand connector, which dials it as a
+    /// manual connection.
+    fn check_on_demand_peer_link(
+        &self,
+        peer_id: PeerId,
+        origin: PeerConnectionOrigin,
+    ) -> Result<(), Error> {
+        if origin.is_configured() || !self.on_demand_peers.contains(&peer_id) {
+            return Ok(());
+        }
+        Err(Error::Other(anyhow::anyhow!(
+            "refused {origin:?} link to on-demand peer {peer_id}, only its on-demand connector links to it"
+        )))
     }
 
     pub async fn add_client_tunnel_with_peer_id_hint(
@@ -2074,6 +2128,7 @@ impl PeerConnectionAdmission {
             ));
         }
         if is_local_network {
+            self.check_on_demand_peer_link(peer_id, origin)?;
             let local_secure_mode = self
                 .context
                 .secure_mode()
@@ -2119,9 +2174,10 @@ impl PeerConnectionAdmission {
         );
         let mut reserved_peer_id_network_name = None;
         let handshake_ret = conn
-            .do_handshake_as_server_ext(|peer, network_name: &str| {
+            .do_handshake_as_server_ext(|peer, network_name: &str, remote_peer_id| {
                 if network_name == self.context.network_identity().network_name {
-                    return Ok(());
+                    // refusing before answering keeps the dialer from recording the link
+                    return self.check_on_demand_peer_link(remote_peer_id, origin);
                 }
 
                 let mut peer_id = self

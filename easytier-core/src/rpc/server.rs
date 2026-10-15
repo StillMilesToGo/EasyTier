@@ -214,6 +214,7 @@ impl Server {
         reg: Arc<ServiceRegistry>,
         tunnel_info: Option<TunnelInfo>,
     ) -> Result<Bytes> {
+        let caller = packet.from_peer;
         let body = if let Some(compression_info) = packet.compression_info {
             decompress_packet(
                 compression_info.algo.try_into().unwrap_or_default(),
@@ -224,7 +225,14 @@ impl Server {
             packet.body
         };
         let rpc_request = RpcRequest::decode(Bytes::from(body))?;
-        dispatch_request(reg.as_ref(), descriptor, rpc_request, tunnel_info).await
+        dispatch_request(
+            reg.as_ref(),
+            Some(caller),
+            descriptor,
+            rpc_request,
+            tunnel_info,
+        )
+        .await
     }
 
     async fn handle_rpc(

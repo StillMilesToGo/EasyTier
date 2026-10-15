@@ -62,15 +62,27 @@ center, the same costs `--latency-first` routing uses.
 Enable `--latency-first` on the node so its forwarding follows the same latency
 costs the decision uses.
 
+## Only the on-demand connector links the node to the peer
+
+The node holds no other connection to an on-demand peer, whatever the peer is
+configured to do:
+
+- It never opens automatic P2P connections to the peer.
+- It answers the peer's direct-connect and hole-punching requests as if it did
+  not offer those services. A peer running EasyTier then stops asking for an
+  hour.
+- It refuses any other connection with the peer, such as one the peer dials in,
+  during the handshake, and closes those that came up before the peer's ID was
+  known, for example while the peer restarted.
+
 ## Recommended setup
 
 - Give the on-demand node at least one other way into the network. In a NAT'd
   setup, that is the P2P connections hole punching establishes with the other
   nodes; those nodes keep regular connections to the public node.
-- Start the public node with `--disable-p2p`. The on-demand node never opens
-  automatic P2P connections to its on-demand peers, but `--disable-p2p` also
-  stops the public node from opening them towards the node, for example over a
-  public IPv6 address of the node.
+- Start the public node with `--disable-p2p` if you can. It is not needed for
+  the behaviour above, but it keeps the public node from sending the requests
+  the on-demand node refuses.
 
 ## Limitations
 

@@ -299,6 +299,15 @@ impl Peer {
         })
     }
 
+    /// Live connections this node's configuration did not ask for.
+    pub(crate) fn unconfigured_conn_ids(&self) -> Vec<PeerConnId> {
+        self.conns
+            .iter()
+            .filter(|entry| !entry.value().is_closed() && !entry.value().origin().is_configured())
+            .map(|entry| *entry.key())
+            .collect()
+    }
+
     pub fn get_directly_connections(&self) -> DashSet<uuid::Uuid> {
         self.conns
             .iter()

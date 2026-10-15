@@ -1,7 +1,8 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use dashmap::DashMap;
 
+use crate::config::PeerId;
 use crate::foundation::small_map_shard_amount;
 use crate::proto::common::RpcDescriptor;
 use crate::proto::rpc_types;
@@ -74,8 +75,12 @@ impl ServiceEntry {
     }
 }
 
+/// Decides whether a peer may call a service.
+pub type ServiceAccessFilter = Arc<dyn Fn(PeerId, &ServiceKey) -> bool + Send + Sync>;
+
 pub struct ServiceRegistry {
     table: DashMap<ServiceKey, ServiceEntry>,
+    access_filter: RwLock<Option<ServiceAccessFilter>>,
 }
 
 impl Default for ServiceRegistry {
@@ -88,7 +93,14 @@ impl ServiceRegistry {
     pub fn new() -> Self {
         Self {
             table: DashMap::with_shard_amount(small_map_shard_amount()),
+            access_filter: RwLock::new(None),
         }
+    }
+
+    /// Sets the filter consulted for calls made on behalf of a peer. A call it refuses
+    /// fails the same way as a call to a service that is not registered.
+    pub fn set_access_filter(&self, filter: Option<ServiceAccessFilter>) {
+        *self.access_filter.write().unwrap() = filter;
     }
 
     pub fn replace_registry(&self, registry: &ServiceRegistry) {
@@ -170,11 +182,30 @@ impl ServiceRegistry {
         ctrl: RpcController,
         input: bytes::Bytes,
     ) -> rpc_types::error::Result<bytes::Bytes> {
+        self.call_method_from(None, rpc_desc, ctrl, input).await
+    }
+
+    /// Calls a method on behalf of `caller`, the peer that sent the request, if any.
+    pub async fn call_method_from(
+        &self,
+        caller: Option<PeerId>,
+        rpc_desc: RpcDescriptor,
+        ctrl: RpcController,
+        input: bytes::Bytes,
+    ) -> rpc_types::error::Result<bytes::Bytes> {
         let service_key = ServiceKey::from(&rpc_desc);
         let method_index = rpc_desc.method_index as u8;
+        let refused = caller.is_some_and(|caller| {
+            self.access_filter
+                .read()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|allows| !allows(caller, &service_key))
+        });
         let entry = self
             .table
             .get(&service_key)
+            .filter(|_| !refused)
             .ok_or(rpc_types::error::Error::InvalidServiceKey(
                 service_key.service_name.clone(),
                 service_key.proto_name.clone(),

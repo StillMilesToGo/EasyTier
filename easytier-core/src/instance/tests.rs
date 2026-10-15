@@ -3546,6 +3546,121 @@ virtual_ip = "10.82.0.2/24"
     }
 
     #[tokio::test]
+    async fn on_demand_node_refuses_links_its_peer_opens() {
+        // the plain handshake and the secure-mode one both refuse the peer
+        for secure in [false, true] {
+            refuses_links_an_on_demand_peer_opens(secure).await;
+        }
+    }
+
+    async fn refuses_links_an_on_demand_peer_opens(secure: bool) {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        use crate::proto::{
+            peer_rpc::{
+                DirectConnectorRpc as _, DirectConnectorRpcClientFactory, GetIpListRequest,
+            },
+            rpc_types::{controller::BaseController, error::Error as RpcError},
+        };
+
+        let process_runtime = CoreProcessRuntime::new();
+        let build = |key: u8, configure: &dyn Fn(&mut CoreInstanceConfig)| {
+            let mut config = test_config("on-demand-refusal");
+            config.connectivity.listeners = Some(ListenerRuntimeConfig::new(
+                Vec::new(),
+                false,
+                SocketContext::default(),
+            ));
+            if secure {
+                let private = StaticSecret::from([key; 32]);
+                let public = PublicKey::from(&private);
+                config.peer.snapshot.runtime.secure_mode =
+                    Some(crate::proto::common::SecureModeConfig {
+                        enabled: true,
+                        local_private_key: Some(BASE64_STANDARD.encode(private.as_bytes())),
+                        local_public_key: Some(BASE64_STANDARD.encode(public.as_bytes())),
+                    });
+            }
+            configure(&mut config);
+            let (packet_sink, _packet_receiver) = tokio::sync::mpsc::channel(16);
+            CoreInstance::new(
+                config,
+                adapters_with_process_runtime(None, Arc::new(packet_sink), process_runtime.clone()),
+            )
+            .unwrap()
+        };
+
+        // unlike the recommended setup, the relay keeps automatic P2P enabled
+        let relay = build(1, &|_| {});
+        relay.start().await.unwrap();
+        let relay_url = ring_url(&relay);
+        let relay_id = relay.peer_id();
+
+        let bridge = build(2, &|config| {
+            config.connectivity.initial_peers = vec![relay_url.clone()];
+        });
+        bridge.start().await.unwrap();
+        let bridge_url = ring_url(&bridge);
+
+        let node = build(3, &|config| {
+            config.connectivity.on_demand_peers = vec![relay_url.clone()];
+            config.connectivity.manual.on_demand = OnDemandOptions {
+                min_connected: Duration::from_secs(1),
+                idle_hold_min: Duration::from_secs(1),
+                idle_hold_max: Duration::from_secs(2),
+                ..Default::default()
+            };
+        });
+        node.start().await.unwrap();
+        let node_id = node.peer_id();
+        wait_until("the node bootstraps through the relay", || {
+            has_direct_peer(&node, relay_id)
+        })
+        .await;
+
+        // the relay dials the node on its own as well
+        relay.add_connector(ring_url(&node)).unwrap();
+        node.add_connector(bridge_url).unwrap();
+
+        // the node drops its own link, and the relay's dials never get in
+        wait_until("the node drops every relay link", || async {
+            !has_direct_peer(&node, relay_id).await && has_route(&node, relay_id).await
+        })
+        .await;
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(!has_direct_peer(&node, relay_id).await, "secure={secure}");
+
+        // the relay is refused the direct-connect service as if the node did not offer it
+        let get_ip_list = |from: &CoreInstance<TestHost>| {
+            let peer_manager = from.peer_manager().clone();
+            async move {
+                peer_manager
+                    .get_peer_rpc_mgr()
+                    .rpc_client()
+                    .scoped_client::<DirectConnectorRpcClientFactory<BaseController>>(
+                        peer_manager.my_peer_id(),
+                        node_id,
+                        peer_manager.network_name().to_owned(),
+                    )
+                    .get_ip_list(BaseController::default(), GetIpListRequest {})
+                    .await
+            }
+        };
+        let refused = get_ip_list(&relay).await;
+        assert!(
+            matches!(refused, Err(RpcError::InvalidServiceKey(..))),
+            "secure={secure}: {refused:?}"
+        );
+        let answered = get_ip_list(&bridge).await;
+        assert!(answered.is_ok(), "secure={secure}: {answered:?}");
+
+        node.stop().await;
+        bridge.stop().await;
+        relay.stop().await;
+    }
+
+    #[tokio::test]
     async fn secure_relay_session_crosses_obfuscated_links() {
         use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
         use x25519_dalek::{PublicKey, StaticSecret};

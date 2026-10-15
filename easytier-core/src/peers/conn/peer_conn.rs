@@ -473,6 +473,10 @@ impl PeerConn {
         self.conn_id
     }
 
+    pub(crate) fn origin(&self) -> PeerConnectionOrigin {
+        self.origin
+    }
+
     pub(crate) fn is_attached(&self) -> bool {
         self.origin == PeerConnectionOrigin::Attached
     }
@@ -1051,7 +1055,7 @@ impl PeerConn {
         mut handshake_recved: Fn,
     ) -> Result<NoiseHandshakeResult, Error>
     where
-        Fn: FnMut(&mut PeerConn, &str) -> Result<(), Error> + Send,
+        Fn: FnMut(&mut PeerConn, &str, PeerId) -> Result<(), Error> + Send,
     {
         let prologue = b"easytier-peerconn-noise".to_vec();
 
@@ -1081,7 +1085,7 @@ impl PeerConn {
         self.record_control_rx(&remote_network_name, first_msg1_len);
 
         // this may update my peer id
-        handshake_recved(self, &remote_network_name)?;
+        handshake_recved(self, &remote_network_name, remote_peer_id)?;
 
         let server_network_name = self.context.network_name();
         let (role_hint, secret_proof_32) = if msg1_pb.a_network_name == server_network_name {
@@ -1229,13 +1233,16 @@ impl PeerConn {
         }
     }
 
+    /// Answers a handshake. `handshake_recved` gets the remote network name and peer ID
+    /// before any answer is sent, so an error from it refuses the peer before the peer
+    /// records the connection.
     #[tracing::instrument(skip(handshake_recved))]
     pub async fn do_handshake_as_server_ext<Fn>(
         &mut self,
         mut handshake_recved: Fn,
     ) -> Result<(), Error>
     where
-        Fn: FnMut(&mut PeerConn, &str) -> Result<(), Error> + Send,
+        Fn: FnMut(&mut PeerConn, &str, PeerId) -> Result<(), Error> + Send,
     {
         let first_pkt = timeout(
             Duration::from_secs(5),
@@ -1263,7 +1270,7 @@ impl PeerConn {
             self.is_client = Some(false);
         } else if hdr.packet_type == PacketType::HandShake as u8 {
             let rsp = Self::decode_handshake_packet(&first_pkt)?;
-            handshake_recved(self, &rsp.network_name)?;
+            handshake_recved(self, &rsp.network_name, rsp.my_peer_id)?;
             tracing::info!("handshake request: {:?}", rsp);
             self.record_control_rx(&rsp.network_name, first_pkt.buf_len() as u64);
             self.info = Some(rsp);

@@ -4,6 +4,7 @@ use bytes::Bytes;
 use std::time::Duration;
 
 use crate::{
+    config::PeerId,
     foundation::time::timeout,
     proto::{
         common::{RpcDescriptor, RpcRequest, TunnelInfo},
@@ -17,12 +18,14 @@ use crate::{
 
 pub(crate) async fn dispatch_request(
     registry: &ServiceRegistry,
+    caller: Option<PeerId>,
     descriptor: RpcDescriptor,
     request: RpcRequest,
     tunnel_info: Option<TunnelInfo>,
 ) -> Result<Bytes> {
     dispatch_payload(
         registry,
+        caller,
         descriptor,
         Bytes::from(request.request),
         Some(Duration::from_millis(request.timeout_ms as u64)),
@@ -33,6 +36,7 @@ pub(crate) async fn dispatch_request(
 
 pub(crate) async fn dispatch_payload(
     registry: &ServiceRegistry,
+    caller: Option<PeerId>,
     descriptor: RpcDescriptor,
     raw_request: Bytes,
     timeout_duration: Option<Duration>,
@@ -41,7 +45,7 @@ pub(crate) async fn dispatch_payload(
     let mut controller = BaseController::default();
     controller.set_raw_input(raw_request.clone());
     controller.set_tunnel_info(tunnel_info);
-    let call = registry.call_method(descriptor, controller.clone(), raw_request);
+    let call = registry.call_method_from(caller, descriptor, controller.clone(), raw_request);
     let response = match timeout_duration {
         Some(duration) => timeout(duration, call).await??,
         None => call.await?,

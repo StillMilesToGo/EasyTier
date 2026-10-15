@@ -683,6 +683,27 @@ where
         return Vec::new();
     };
 
+    // admission refuses other links to an on-demand peer once its ID is known; close
+    // those that came up before, for example while the peer restarted with a new ID
+    let peer_ids = data
+        .state
+        .on_demand
+        .lock()
+        .unwrap()
+        .values()
+        .filter_map(|link| link.peer_id())
+        .collect::<Vec<_>>();
+    for peer_id in peer_ids {
+        let closed = peer_manager.close_unconfigured_conns(peer_id).await;
+        if closed > 0 {
+            tracing::info!(
+                peer_id,
+                closed,
+                "on-demand connector closed links it did not open"
+            );
+        }
+    }
+
     let link_latencies = peer_manager.direct_link_latencies_ms().await;
     let active_peers = peer_manager.active_data_peers(ACTIVITY_TTL);
     let mut to_connect = Vec::new();

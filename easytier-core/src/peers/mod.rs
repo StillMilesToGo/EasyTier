@@ -38,6 +38,14 @@ pub(crate) enum PeerConnectionOrigin {
     Attached,
 }
 
+impl PeerConnectionOrigin {
+    /// Whether the link was opened because this node's configuration asks for it, as
+    /// opposed to automatic P2P or the remote peer dialing in.
+    pub(crate) fn is_configured(self) -> bool {
+        matches!(self, Self::Manual | Self::Attached)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PeerPacketIngress {
     Local,

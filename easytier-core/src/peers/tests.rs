@@ -53,7 +53,7 @@ impl PeerContext for LimitedPeerContext {
 impl PeerConn {
     #[tracing::instrument]
     async fn do_handshake_as_server(&mut self) -> Result<(), Error> {
-        self.do_handshake_as_server_ext(|_, _| Ok(())).await
+        self.do_handshake_as_server_ext(|_, _, _| Ok(())).await
     }
 }
 
@@ -467,6 +467,58 @@ async fn peer_channel_uses_admission_origin_instead_of_packet_header() {
             origin: PeerConnectionOrigin::Attached,
         }
     );
+}
+
+#[tokio::test]
+async fn peer_map_closes_only_unconfigured_conns() {
+    let peer_session_store = Arc::new(PeerSessionStore::new());
+    let client_ctx = Arc::new(NoopPeerContext::default());
+    let server_ctx = Arc::new(NoopPeerContext::default());
+    let (client_tx, _client_rx) = create_packet_recv_chan();
+    let client_map = PeerMap::new(client_tx, client_ctx.clone(), 1);
+
+    // node 1 dials node 2 from its peer list and also reaches it by hole punching
+    let mut server_conns = Vec::new();
+    for origin in [
+        PeerConnectionOrigin::Manual,
+        PeerConnectionOrigin::UdpHolePunch,
+    ] {
+        let (client_tunnel, server_tunnel) = create_ring_tunnel_pair();
+        let mut client_conn = PeerConn::new_with_peer_id_hint_and_origin(
+            1,
+            client_ctx.clone(),
+            client_tunnel,
+            None,
+            peer_session_store.clone(),
+            origin,
+        );
+        let mut server_conn = PeerConn::new(
+            2,
+            server_ctx.clone(),
+            server_tunnel,
+            peer_session_store.clone(),
+        );
+        let (client_ret, server_ret) = tokio::join!(
+            client_conn.do_handshake_as_client(),
+            server_conn.do_handshake_as_server()
+        );
+        client_ret.unwrap();
+        server_ret.unwrap();
+        client_map.add_new_peer_conn(client_conn).await.unwrap();
+        server_conns.push(server_conn);
+    }
+
+    assert_eq!(client_map.close_unconfigured_conns(2).await, 1);
+    let peer = client_map.get_peer_by_id(2).unwrap();
+    timeout(Duration::from_secs(1), async {
+        while peer.list_peer_conns().await.len() > 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(peer.unconfigured_conn_ids().is_empty());
+    assert_eq!(client_map.close_unconfigured_conns(2).await, 0);
 }
 
 #[tokio::test]

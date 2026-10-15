@@ -153,6 +153,21 @@ impl PeerMap {
         closed
     }
 
+    /// Closes the connections to `peer_id` this node's configuration did not ask for,
+    /// returning how many were closed.
+    pub(crate) async fn close_unconfigured_conns(&self, peer_id: PeerId) -> usize {
+        let Some(peer) = self.get_peer_by_id(peer_id) else {
+            return 0;
+        };
+        let mut closed = 0;
+        for conn_id in peer.unconfigured_conn_ids() {
+            if peer.close_peer_conn(&conn_id).await.is_ok() {
+                closed += 1;
+            }
+        }
+        closed
+    }
+
     pub fn get_peer_by_id(&self, peer_id: PeerId) -> Option<Arc<Peer>> {
         self.peer_map.get(&peer_id).map(|v| v.clone())
     }
