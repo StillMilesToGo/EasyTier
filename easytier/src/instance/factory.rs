@@ -468,11 +468,13 @@ mod tests {
                         bind_addr: tcp_reservation.local_addr().unwrap(),
                         dst_addr: tcp_echo.local_addr().unwrap(),
                         proto: "tcp".to_owned(),
+                        proxy_protocol: None,
                     },
                     PortForwardConfig {
                         bind_addr: udp_reservation.local_addr().unwrap(),
                         dst_addr: udp_echo.local_addr().unwrap(),
                         proto: "udp".to_owned(),
+                        proxy_protocol: None,
                     },
                 ];
                 let config = isolated_config(multi_thread, 2);
@@ -559,6 +561,85 @@ mod tests {
                 });
                 assert_eq!(instance.state(), CoreInstanceState::Stopped);
             }
+        }
+    }
+
+    #[cfg(all(feature = "smoltcp", feature = "management"))]
+    #[tokio::test]
+    async fn tcp_port_forward_sends_proxy_protocol_header() {
+        use easytier_core::{
+            config::{
+                gateway::{PortForwardConfig, ProxyProtocolVersion},
+                runtime::CoreInstanceRuntimeConfig,
+            },
+            instance::CoreInstanceConfig,
+        };
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        for version in [ProxyProtocolVersion::V1, ProxyProtocolVersion::V2] {
+            let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let bind_addr = reservation.local_addr().unwrap();
+            let forward = PortForwardConfig {
+                bind_addr,
+                dst_addr: backend.local_addr().unwrap(),
+                proto: "tcp".to_owned(),
+                proxy_protocol: Some(version),
+            };
+            let config = isolated_config(false, 2);
+            config.set_ipv4(Some("127.0.0.1/32".parse().unwrap()));
+            let instance = create_native_instance(config.clone()).unwrap();
+            instance.start().await.unwrap();
+            drop(reservation);
+            let mut normalized = CoreInstanceConfig::from_toml(&config).unwrap();
+            normalized.connectivity.runtime.gateway.port_forwards = vec![forward];
+            instance
+                .update_runtime_config(CoreInstanceRuntimeConfig {
+                    services: normalized.connectivity.runtime,
+                    peer: Arc::new(normalized.peer.snapshot),
+                })
+                .await
+                .unwrap();
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut client = tokio::net::TcpStream::connect(bind_addr).await.unwrap();
+                let client_addr = client.local_addr().unwrap();
+                client.write_all(b"ping").await.unwrap();
+
+                let (mut stream, _) = backend.accept().await.unwrap();
+                let expected_header = match version {
+                    ProxyProtocolVersion::V1 => format!(
+                        "PROXY TCP4 {} {} {} {}\r\n",
+                        client_addr.ip(),
+                        bind_addr.ip(),
+                        client_addr.port(),
+                        bind_addr.port()
+                    )
+                    .into_bytes(),
+                    ProxyProtocolVersion::V2 => {
+                        let mut header = vec![
+                            0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+                            0x21, 0x11, 0x00, 0x0C,
+                        ];
+                        header.extend_from_slice(&[127, 0, 0, 1, 127, 0, 0, 1]);
+                        header.extend_from_slice(&client_addr.port().to_be_bytes());
+                        header.extend_from_slice(&bind_addr.port().to_be_bytes());
+                        header
+                    }
+                };
+                let mut received = vec![0; expected_header.len() + 4];
+                stream.read_exact(&mut received).await.unwrap();
+                assert_eq!(&received[..expected_header.len()], &expected_header[..]);
+                assert_eq!(&received[expected_header.len()..], b"ping");
+
+                stream.write_all(b"pong").await.unwrap();
+                let mut reply = [0; 4];
+                client.read_exact(&mut reply).await.unwrap();
+                assert_eq!(&reply, b"pong");
+            })
+            .await
+            .expect("PROXY protocol port forward must deliver the header and payload");
+            instance.stop().await;
         }
     }
 

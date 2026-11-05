@@ -214,6 +214,11 @@ sudo go run . \
   -port-forward udp://127.0.0.1:5202/10.144.0.20:5201
 ```
 
+Append `?proxy_protocol=v1` or `?proxy_protocol=v2` to a TCP rule to send a
+PROXY protocol header carrying the original client address to the overlay
+target, for example
+`-port-forward 'tcp://0.0.0.0:8080/10.144.0.20:80?proxy_protocol=v2'`.
+
 For example, run `iperf3 -c 127.0.0.1 -p 5202` for TCP or add
 `-u -b 0 -l 1200` for UDP. iperf3's UDP mode still needs the TCP forward for
 its control connection. The TUN example only parses these rules into the

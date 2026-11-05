@@ -255,14 +255,20 @@ const SelectButtonStub = defineComponent({
   props: {
     modelValue: String,
     options: Array,
+    optionLabel: String,
+    optionValue: String,
   },
   emits: ['update:modelValue'],
   setup(props, { emit }) {
+    const field = (option: unknown, key?: string) =>
+      key ? (option as Record<string, string>)[key] : option as string
     return () => h('select', {
       value: props.modelValue,
       'data-stub': 'select-button',
       onChange: (event: Event) => emit('update:modelValue', (event.target as HTMLSelectElement).value),
-    }, (props.options ?? []).map((option) => h('option', { value: option as string }, option as string)))
+    }, (props.options ?? []).map((option) => h('option', {
+      value: field(option, props.optionValue),
+    }, field(option, props.optionLabel))))
   },
 })
 
@@ -535,6 +541,29 @@ describe('Config.vue network config projection', () => {
 
     await setInput(wrapper, '#tld_dns_zone', '')
     expect(toBackendNetworkConfig(curNetwork).tld_dns_zone).toBeUndefined()
+  })
+
+  it('offers PROXY protocol only for TCP port forwards', async () => {
+    const { curNetwork, wrapper } = mountConfig()
+    await nextTick()
+
+    const selects = () => wrapper.findAll<HTMLSelectElement>('select[data-stub="select-button"]')
+    // The UDP rule has no PROXY protocol selector.
+    expect(selects()).toHaveLength(1)
+
+    await selects()[0].setValue('tcp')
+    expect(selects()).toHaveLength(2)
+    await selects()[1].setValue('v2')
+    expect(curNetwork.port_forwards[0].proxy_protocol).toBe('v2')
+    expect(toBackendNetworkConfig(curNetwork).port_forwards[0]).toMatchObject({
+      proto: 'tcp',
+      proxy_protocol: 'v2',
+    })
+
+    // Switching back to UDP clears the TCP-only option.
+    await selects()[0].setValue('udp')
+    expect(selects()).toHaveLength(1)
+    expect(curNetwork.port_forwards[0].proxy_protocol).toBe('')
   })
 
   it('shows a flag the configuration does not state as the value the core resolves', async () => {

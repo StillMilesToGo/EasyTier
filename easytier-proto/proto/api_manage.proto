@@ -152,6 +152,8 @@ message PortForwardConfig {
   string dst_ip = 3;
   uint32 dst_port = 4;
   string proto = 5;
+  // Empty disables it; "v1" or "v2" sends a PROXY protocol header (TCP only).
+  string proxy_protocol = 6;
 }
 
 message MyNodeInfo {

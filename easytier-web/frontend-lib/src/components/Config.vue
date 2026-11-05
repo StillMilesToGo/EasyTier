@@ -149,6 +149,18 @@ function setFlag(field: keyof NetworkConfig, value: boolean) {
 }
 
 const portForwardProtocolOptions = ref(["tcp", "udp"]);
+const portForwardProxyProtocolOptions = computed(() => [
+  { label: t('port_forwards_proxy_protocol_off'), value: '' },
+  { label: 'PROXY v1', value: 'v1' },
+  { label: 'PROXY v2', value: 'v2' },
+]);
+
+// The PROXY protocol header is TCP-only; drop it when a rule switches to UDP.
+function onPortForwardProtoChange(row: { proxy_protocol?: string }, proto: string) {
+  if (proto !== 'tcp') {
+    row.proxy_protocol = '';
+  }
+}
 
 const editingPortForward = ref(false);
 const editingPortForwardIndex = ref(-1);
@@ -593,7 +605,8 @@ function removeVpnPortalClient(index: number) {
                   <div v-for="(row, index) in curNetwork.port_forwards" :key="index" class="form-row">
                     <!-- Wide screen view -->
                     <div v-if="!isCompact" class="flex gap-2 items-end">
-                      <SelectButton v-model="row.proto" :options="portForwardProtocolOptions" :allow-empty="false" />
+                      <SelectButton v-model="row.proto" :options="portForwardProtocolOptions" :allow-empty="false"
+                        @update:model-value="(proto: string) => onPortForwardProtoChange(row, proto)" />
                       <div style="flex-grow: 4;">
                         <InputGroup>
                           <InputText v-model="row.bind_ip" :placeholder="t('port_forwards_bind_addr')" />
@@ -614,6 +627,9 @@ function removeVpnPortalClient(index: number) {
                             mode="decimal" :min="1" :max="65535" fluid class="max-w-20" />
                         </InputGroup>
                       </div>
+                      <SelectButton v-if="row.proto === 'tcp'" v-model="row.proxy_protocol"
+                        :options="portForwardProxyProtocolOptions" option-label="label" option-value="value"
+                        :allow-empty="false" v-tooltip="t('port_forwards_proxy_protocol_help')" />
                       <div style="flex-grow: 1;">
                         <Button v-if="curNetwork.port_forwards.length > 0" icon="pi pi-trash" severity="danger" text
                           rounded @click="removeRow(index, curNetwork.port_forwards)" />
@@ -622,7 +638,8 @@ function removeVpnPortalClient(index: number) {
                     <!-- Small screen view -->
                     <div v-else class="flex justify-between items-center p-2 border-b">
                       <span>{{ row.proto }}://{{ row.bind_ip }}:{{ row.bind_port }}/{{ row.dst_ip }}:{{
-                        row.dst_port }}</span>
+                        row.dst_port }}<template v-if="row.proxy_protocol">?proxy_protocol={{ row.proxy_protocol
+                        }}</template></span>
                       <div class="flex gap-2">
                         <Button icon="pi pi-pencil" class="p-button-sm" @click="openPortForwardEditor(index)" />
                         <Button icon="pi pi-trash" class="p-button-sm p-button-danger"
@@ -640,7 +657,8 @@ function removeVpnPortalClient(index: number) {
                     :style="{ width: '90vw', maxWidth: '600px' }">
                     <div v-if="editingPortForwardData" class="flex flex-col gap-4">
                       <SelectButton v-model="editingPortForwardData.proto" :options="portForwardProtocolOptions"
-                        :allow-empty="false" />
+                        :allow-empty="false"
+                        @update:model-value="(proto: string) => onPortForwardProtoChange(editingPortForwardData, proto)" />
                       <InputGroup>
                         <InputText v-model="editingPortForwardData.bind_ip"
                           :placeholder="t('port_forwards_bind_addr')" />
@@ -658,6 +676,12 @@ function removeVpnPortalClient(index: number) {
                         <InputNumber v-model="editingPortForwardData.dst_port" :format="false" :step="1" mode="decimal"
                           :min="1" :max="65535" class="max-w-20" />
                       </InputGroup>
+                      <div v-if="editingPortForwardData.proto === 'tcp'" class="flex flex-col gap-2">
+                        <label>{{ t('port_forwards_proxy_protocol_help') }}</label>
+                        <SelectButton v-model="editingPortForwardData.proxy_protocol"
+                          :options="portForwardProxyProtocolOptions" option-label="label" option-value="value"
+                          :allow-empty="false" />
+                      </div>
                     </div>
                     <template #footer>
                       <Button :label="t('web.common.cancel')" icon="pi pi-times" @click="editingPortForward = false"

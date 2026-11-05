@@ -40,11 +40,24 @@ const (
 	PortForwardUDP PortForwardProtocol = "udp"
 )
 
+// ProxyProtocolVersion selects the PROXY protocol header a TCP port forward
+// sends to its destination. The zero value sends no header.
+type ProxyProtocolVersion string
+
+const (
+	ProxyProtocolNone ProxyProtocolVersion = ""
+	ProxyProtocolV1   ProxyProtocolVersion = "v1"
+	ProxyProtocolV2   ProxyProtocolVersion = "v2"
+)
+
 // PortForwardConfig exposes a host socket through the EasyTier data plane.
 type PortForwardConfig struct {
 	Protocol    PortForwardProtocol
 	Bind        netip.AddrPort
 	Destination netip.AddrPort
+	// ProxyProtocol sends a PROXY protocol header carrying the original client
+	// address ahead of the forwarded stream. Only TCP forwards support it.
+	ProxyProtocol ProxyProtocolVersion
 }
 
 // InstanceConfig is an immutable EasyTier instance configuration.
@@ -388,6 +401,21 @@ func validatePortForwards(forwards []PortForwardConfig) error {
 			return invalidInstanceConfig(
 				field+".destination",
 				"port must not be zero",
+			)
+		}
+		switch forward.ProxyProtocol {
+		case ProxyProtocolNone:
+		case ProxyProtocolV1, ProxyProtocolV2:
+			if forward.Protocol != PortForwardTCP {
+				return invalidInstanceConfig(
+					field+".proxy_protocol",
+					"is only supported by TCP port forwards",
+				)
+			}
+		default:
+			return invalidInstanceConfig(
+				field+".proxy_protocol",
+				"must be empty, v1 or v2",
 			)
 		}
 		if _, exists := seen[forward]; exists {

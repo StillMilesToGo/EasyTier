@@ -1157,6 +1157,7 @@ mod tests {
                 dst_ip: "10.88.0.8".to_string(),
                 dst_port: 80,
                 proto: "tcp".to_string(),
+                proxy_protocol: String::new(),
             }],
             disable_udp_hole_punching: Some(true),
             disable_tcp_hole_punching: Some(true),

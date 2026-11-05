@@ -52,6 +52,13 @@ func encodeInstanceConfig(config InstanceConfig) (string, error) {
 			forward.Destination.String(),
 		)
 		writeTOMLStringField(&encoded, "proto", string(forward.Protocol))
+		if forward.ProxyProtocol != ProxyProtocolNone {
+			writeTOMLStringField(
+				&encoded,
+				"proxy_protocol",
+				string(forward.ProxyProtocol),
+			)
+		}
 	}
 
 	if document.encryption != nil ||

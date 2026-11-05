@@ -16,6 +16,16 @@ const (
 	PortForwardUDP PortForwardProtocol = internalhost.PortForwardUDP
 )
 
+// ProxyProtocolVersion selects the PROXY protocol header a TCP port forward
+// sends to its destination. The zero value sends no header.
+type ProxyProtocolVersion = internalhost.ProxyProtocolVersion
+
+const (
+	ProxyProtocolNone ProxyProtocolVersion = internalhost.ProxyProtocolNone
+	ProxyProtocolV1   ProxyProtocolVersion = internalhost.ProxyProtocolV1
+	ProxyProtocolV2   ProxyProtocolVersion = internalhost.ProxyProtocolV2
+)
+
 // PortForwardConfig exposes a host socket through the EasyTier data plane.
 type PortForwardConfig = internalhost.PortForwardConfig
 

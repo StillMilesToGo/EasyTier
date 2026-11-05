@@ -34,9 +34,10 @@ func TestInstanceConfigEncodesSupportedSettings(t *testing.T) {
 		).
 		AddPortForwards(
 			PortForwardConfig{
-				Protocol:    PortForwardTCP,
-				Bind:        netip.MustParseAddrPort("127.0.0.1:5202"),
-				Destination: netip.MustParseAddrPort("10.144.0.20:5201"),
+				Protocol:      PortForwardTCP,
+				Bind:          netip.MustParseAddrPort("127.0.0.1:5202"),
+				Destination:   netip.MustParseAddrPort("10.144.0.20:5201"),
+				ProxyProtocol: ProxyProtocolV2,
 			},
 			PortForwardConfig{
 				Protocol:    PortForwardUDP,
@@ -90,6 +91,7 @@ uri = "udp://203.0.113.20"
 bind_addr = "127.0.0.1:5202"
 dst_addr = "10.144.0.20:5201"
 proto = "tcp"
+proxy_protocol = "v2"
 
 [[port_forward]]
 bind_addr = "0.0.0.0:5203"
@@ -351,6 +353,36 @@ func TestInstanceConfigValidation(t *testing.T) {
 				return err
 			},
 			wantField: "port_forwards[0].destination",
+		},
+		{
+			name: "PROXY protocol on UDP port forward",
+			build: func() error {
+				_, err := validInstanceConfigBuilder().
+					AddPortForwards(PortForwardConfig{
+						Protocol:      PortForwardUDP,
+						Bind:          netip.MustParseAddrPort("127.0.0.1:5202"),
+						Destination:   netip.MustParseAddrPort("10.144.0.20:5201"),
+						ProxyProtocol: ProxyProtocolV1,
+					}).
+					Build()
+				return err
+			},
+			wantField: "port_forwards[0].proxy_protocol",
+		},
+		{
+			name: "unsupported PROXY protocol version",
+			build: func() error {
+				_, err := validInstanceConfigBuilder().
+					AddPortForwards(PortForwardConfig{
+						Protocol:      PortForwardTCP,
+						Bind:          netip.MustParseAddrPort("127.0.0.1:5202"),
+						Destination:   netip.MustParseAddrPort("10.144.0.20:5201"),
+						ProxyProtocol: "v3",
+					}).
+					Build()
+				return err
+			},
+			wantField: "port_forwards[0].proxy_protocol",
 		},
 		{
 			name: "duplicate port forward",

@@ -3141,24 +3141,28 @@ pub async fn port_forward_test(
                         bind_addr: "0.0.0.0:23456".parse().unwrap(),
                         dst_addr: "10.144.144.3:23456".parse().unwrap(),
                         proto: "tcp".to_string(),
+                        proxy_protocol: None,
                     },
                     // test port forward to subnet proxy
                     PortForwardConfig {
                         bind_addr: "0.0.0.0:23457".parse().unwrap(),
                         dst_addr: "10.1.2.4:23457".parse().unwrap(),
                         proto: "tcp".to_string(),
+                        proxy_protocol: None,
                     },
                     // test udp port forward to other virtual node
                     PortForwardConfig {
                         bind_addr: "0.0.0.0:23458".parse().unwrap(),
                         dst_addr: "10.144.144.3:23458".parse().unwrap(),
                         proto: "udp".to_string(),
+                        proxy_protocol: None,
                     },
                     // test udp port forward to subnet proxy
                     PortForwardConfig {
                         bind_addr: "0.0.0.0:23459".parse().unwrap(),
                         dst_addr: "10.1.2.4:23459".parse().unwrap(),
                         proto: "udp".to_string(),
+                        proxy_protocol: None,
                     },
                 ]);
 
@@ -3299,11 +3303,13 @@ pub async fn port_forward_with_inbound_default_drop_acl_test(
                         bind_addr: "0.0.0.0:23456".parse().unwrap(),
                         dst_addr: "10.144.144.3:23456".parse().unwrap(),
                         proto: "tcp".to_string(),
+                        proxy_protocol: None,
                     },
                     PortForwardConfig {
                         bind_addr: "0.0.0.0:23457".parse().unwrap(),
                         dst_addr: "10.1.2.4:23457".parse().unwrap(),
                         proto: "tcp".to_string(),
+                        proxy_protocol: None,
                     },
                 ]);
 
@@ -5113,6 +5119,7 @@ pub async fn config_patch_test() {
                 bind_addr: Some("0.0.0.0:23458".parse::<SocketAddr>().unwrap().into()),
                 dst_addr: Some("10.144.144.3:23457".parse::<SocketAddr>().unwrap().into()),
                 socket_type: SocketType::Tcp as i32,
+                proxy_protocol: 0,
             }),
         }],
         ..Default::default()

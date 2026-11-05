@@ -154,6 +154,7 @@ impl UdpReloadTest {
     async fn apply(&self, port: u16) -> PortForwardConfig {
         let config = PortForwardConfig {
             proto: "udp".to_owned(),
+            proxy_protocol: None,
             bind_addr: "127.0.0.1:19491".parse().unwrap(),
             dst_addr: SocketAddr::from(([10, 144, 0, 2], port)),
         };
