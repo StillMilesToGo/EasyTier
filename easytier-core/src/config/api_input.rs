@@ -13,7 +13,9 @@ use easytier_proto::common::Flags;
 use optionize::{Optionizable, Optionized};
 
 use crate::config::{
-    MappedListenerPolicy, normalize_secure_mode_config,
+    MappedListenerPolicy,
+    gateway::ProxyProtocolVersion,
+    normalize_secure_mode_config,
     toml::{
         ConfigLoader, NetworkIdentity, PeerConfig, PortForwardConfig, TomlConfigLoader,
         VpnPortalClientConfig, VpnPortalConfig,
@@ -362,15 +364,20 @@ impl NetworkConfigExt for NetworkConfig {
                             format!("{}:{}", pf.dst_ip, pf.dst_port).parse::<SocketAddr>();
 
                         match (bind_addr, dst_addr) {
-                            (Ok(bind_addr), Ok(dst_addr)) => Some(PortForwardConfig {
-                                bind_addr,
-                                dst_addr,
-                                proto: pf.proto.clone(),
-                            }),
+                            (Ok(bind_addr), Ok(dst_addr)) => Some(
+                                ProxyProtocolVersion::parse_optional(&pf.proxy_protocol).map(
+                                    |proxy_protocol| PortForwardConfig {
+                                        bind_addr,
+                                        dst_addr,
+                                        proto: pf.proto.clone(),
+                                        proxy_protocol,
+                                    },
+                                ),
+                            ),
                             _ => None,
                         }
                     })
-                    .collect::<Vec<_>>(),
+                    .collect::<anyhow::Result<Vec<_>>>()?,
             );
         }
 
@@ -634,6 +641,10 @@ impl NetworkConfigExt for NetworkConfig {
                     bind_port: f.bind_addr.port() as u32,
                     dst_ip: f.dst_addr.ip().to_string(),
                     dst_port: f.dst_addr.port() as u32,
+                    proxy_protocol: f
+                        .proxy_protocol
+                        .map(|version| version.as_str().to_string())
+                        .unwrap_or_default(),
                 })
                 .collect();
         }

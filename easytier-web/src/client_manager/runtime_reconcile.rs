@@ -667,6 +667,7 @@ mod tests {
             dst_ip: "10.144.0.1".to_string(),
             dst_port,
             proto: "tcp".to_string(),
+            proxy_protocol: String::new(),
         }
     }
 

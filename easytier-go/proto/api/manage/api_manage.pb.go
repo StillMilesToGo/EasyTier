@@ -1073,12 +1073,14 @@ func (x *NetworkPeerConfig) GetPeerPublicKey() string {
 }
 
 type PortForwardConfig struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	BindIp        string                 `protobuf:"bytes,1,opt,name=bind_ip,json=bindIp,proto3" json:"bind_ip,omitempty"`
-	BindPort      uint32                 `protobuf:"varint,2,opt,name=bind_port,json=bindPort,proto3" json:"bind_port,omitempty"`
-	DstIp         string                 `protobuf:"bytes,3,opt,name=dst_ip,json=dstIp,proto3" json:"dst_ip,omitempty"`
-	DstPort       uint32                 `protobuf:"varint,4,opt,name=dst_port,json=dstPort,proto3" json:"dst_port,omitempty"`
-	Proto         string                 `protobuf:"bytes,5,opt,name=proto,proto3" json:"proto,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	BindIp   string                 `protobuf:"bytes,1,opt,name=bind_ip,json=bindIp,proto3" json:"bind_ip,omitempty"`
+	BindPort uint32                 `protobuf:"varint,2,opt,name=bind_port,json=bindPort,proto3" json:"bind_port,omitempty"`
+	DstIp    string                 `protobuf:"bytes,3,opt,name=dst_ip,json=dstIp,proto3" json:"dst_ip,omitempty"`
+	DstPort  uint32                 `protobuf:"varint,4,opt,name=dst_port,json=dstPort,proto3" json:"dst_port,omitempty"`
+	Proto    string                 `protobuf:"bytes,5,opt,name=proto,proto3" json:"proto,omitempty"`
+	// Empty disables it; "v1" or "v2" sends a PROXY protocol header (TCP only).
+	ProxyProtocol string `protobuf:"bytes,6,opt,name=proxy_protocol,json=proxyProtocol,proto3" json:"proxy_protocol,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1144,6 +1146,13 @@ func (x *PortForwardConfig) GetDstPort() uint32 {
 func (x *PortForwardConfig) GetProto() string {
 	if x != nil {
 		return x.Proto
+	}
+	return ""
+}
+
+func (x *PortForwardConfig) GetProxyProtocol() string {
+	if x != nil {
+		return x.ProxyProtocol
 	}
 	return ""
 }
@@ -2397,13 +2406,14 @@ const file_api_manage_proto_rawDesc = "" +
 	"\x11NetworkPeerConfig\x12\x10\n" +
 	"\x03uri\x18\x01 \x01(\tR\x03uri\x12+\n" +
 	"\x0fpeer_public_key\x18\x02 \x01(\tH\x00R\rpeerPublicKey\x88\x01\x01B\x12\n" +
-	"\x10_peer_public_key\"\x91\x01\n" +
+	"\x10_peer_public_key\"\xb8\x01\n" +
 	"\x11PortForwardConfig\x12\x17\n" +
 	"\abind_ip\x18\x01 \x01(\tR\x06bindIp\x12\x1b\n" +
 	"\tbind_port\x18\x02 \x01(\rR\bbindPort\x12\x15\n" +
 	"\x06dst_ip\x18\x03 \x01(\tR\x05dstIp\x12\x19\n" +
 	"\bdst_port\x18\x04 \x01(\rR\adstPort\x12\x14\n" +
-	"\x05proto\x18\x05 \x01(\tR\x05proto\"\x90\x03\n" +
+	"\x05proto\x18\x05 \x01(\tR\x05proto\x12%\n" +
+	"\x0eproxy_protocol\x18\x06 \x01(\tR\rproxyProtocol\"\x90\x03\n" +
 	"\n" +
 	"MyNodeInfo\x123\n" +
 	"\fvirtual_ipv4\x18\x01 \x01(\v2\x10.common.Ipv4InetR\vvirtualIpv4\x12\x1a\n" +

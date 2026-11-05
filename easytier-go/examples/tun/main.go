@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/netip"
+	"net/url"
 	"os"
 	"os/signal"
 	"runtime"
@@ -395,6 +396,9 @@ func (rules *portForwardList) String() string {
 			rule.Bind,
 			rule.Destination,
 		)
+		if rule.ProxyProtocol != corehost.ProxyProtocolNone {
+			values[index] += "?proxy_protocol=" + string(rule.ProxyProtocol)
+		}
 	}
 	return strings.Join(values, ",")
 }
@@ -406,6 +410,23 @@ func parsePortForwardRule(value string) (corehost.PortForwardConfig, error) {
 			"port forward %q must use tcp:// or udp://",
 			value,
 		)
+	}
+	addresses, query, _ := strings.Cut(addresses, "?")
+	proxyProtocol := corehost.ProxyProtocolNone
+	if query != "" {
+		parameters, err := url.ParseQuery(query)
+		if err != nil {
+			return corehost.PortForwardConfig{}, fmt.Errorf("parse options: %w", err)
+		}
+		for key := range parameters {
+			if key != "proxy_protocol" {
+				return corehost.PortForwardConfig{}, fmt.Errorf(
+					"unknown port forward option %q, supported: proxy_protocol",
+					key,
+				)
+			}
+		}
+		proxyProtocol = corehost.ProxyProtocolVersion(parameters.Get("proxy_protocol"))
 	}
 	bindText, targetText, ok := strings.Cut(addresses, "/")
 	if !ok {
@@ -432,9 +453,10 @@ func parsePortForwardRule(value string) (corehost.PortForwardConfig, error) {
 		protocol = corehost.PortForwardUDP
 	}
 	return corehost.PortForwardConfig{
-		Protocol:    protocol,
-		Bind:        bind,
-		Destination: target,
+		Protocol:      protocol,
+		Bind:          bind,
+		Destination:   target,
+		ProxyProtocol: proxyProtocol,
 	}, nil
 }
 
@@ -446,7 +468,7 @@ func parseOptions() options {
 	flag.Var(
 		&options.portForwards,
 		"port-forward",
-		"tcp://bind/overlay-target or udp://bind/overlay-target; may be repeated",
+		"tcp://bind/overlay-target[?proxy_protocol=v1|v2] or udp://bind/overlay-target; may be repeated",
 	)
 	flag.StringVar(&options.networkName, "network-name", "", "EasyTier network name")
 	flag.StringVar(&options.networkSecret, "network-secret", "", "EasyTier network secret")

@@ -451,6 +451,7 @@ mod tests {
             }],
             port_forwards: vec![crate::proto::api::manage::PortForwardConfig {
                 proto: "tcp".to_owned(),
+                proxy_protocol: String::new(),
                 bind_ip: "127.0.0.1".to_owned(),
                 bind_port: 18080,
                 dst_ip: "10.88.0.2".to_owned(),

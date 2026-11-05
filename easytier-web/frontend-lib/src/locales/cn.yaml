@@ -286,6 +286,8 @@ port_forwards_bind_addr: "绑定地址，如：0.0.0.0"
 port_forwards_dst_addr: "目标地址，如：10.126.126.1"
 port_forwards_add_btn: "添加"
 edit_port_forward: "编辑端口转发"
+port_forwards_proxy_protocol_off: "无 PROXY 头"
+port_forwards_proxy_protocol_help: "向目标发送携带原始客户端地址的 PROXY protocol 头（仅 TCP），目标服务必须开启 PROXY protocol 支持。"
 
 mtu: MTU
 mtu_help: |

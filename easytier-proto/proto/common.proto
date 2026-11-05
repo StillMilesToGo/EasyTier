@@ -266,10 +266,19 @@ enum SocketType {
   UDP = 1;
 }
 
+// PROXY protocol header sent to a TCP port-forward destination.
+enum ProxyProtocolVersion {
+  PROXY_PROTOCOL_VERSION_DISABLED = 0;
+  PROXY_PROTOCOL_VERSION_V1 = 1;
+  PROXY_PROTOCOL_VERSION_V2 = 2;
+}
+
 message PortForwardConfigPb {
   SocketAddr bind_addr = 1;
   SocketAddr dst_addr = 2;
   SocketType socket_type = 3;
+  // Only valid for TCP forwards.
+  ProxyProtocolVersion proxy_protocol = 4;
 }
 
 message ProxyDstInfo { SocketAddr dst_addr = 1; }

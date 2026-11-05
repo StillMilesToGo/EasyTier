@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	corehost "github.com/easytier/easytier/easytier-go"
 	tun "github.com/sagernet/sing-tun"
 )
 
@@ -235,6 +236,7 @@ func TestPortForwardList(t *testing.T) {
 	for _, value := range []string{
 		"tcp://127.0.0.1:5202/10.144.0.20:5201",
 		"udp://0.0.0.0:5203/10.144.0.21:5201",
+		"tcp://127.0.0.1:5204/10.144.0.22:80?proxy_protocol=v2",
 	} {
 		if err := rules.Set(value); err != nil {
 			t.Fatalf("set %q: %v", value, err)
@@ -242,11 +244,18 @@ func TestPortForwardList(t *testing.T) {
 	}
 	if got := rules.String(); got !=
 		"tcp://127.0.0.1:5202/10.144.0.20:5201,"+
-			"udp://0.0.0.0:5203/10.144.0.21:5201" {
+			"udp://0.0.0.0:5203/10.144.0.21:5201,"+
+			"tcp://127.0.0.1:5204/10.144.0.22:80?proxy_protocol=v2" {
 		t.Fatalf("rules string = %q", got)
 	}
 	if err := rules.Set("sctp://127.0.0.1:1/10.0.0.1:2"); err == nil {
 		t.Fatal("unsupported protocol was accepted")
+	}
+	if err := rules.Set("tcp://127.0.0.1:1/10.0.0.1:2?send_proxy=1"); err == nil {
+		t.Fatal("unknown port forward option was accepted")
+	}
+	if rules[2].ProxyProtocol != corehost.ProxyProtocolV2 {
+		t.Fatalf("third port-forward rule = %+v", rules[2])
 	}
 	if rules[0].Protocol != "tcp" ||
 		rules[0].Bind != netip.MustParseAddrPort("127.0.0.1:5202") ||

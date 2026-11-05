@@ -3,9 +3,9 @@ use crate::{
     common::{
         config::{
             ConfigFileControl, ConfigLoader, ConsoleLoggerConfig, FileLoggerConfig,
-            LoggingConfigLoader, NetworkIdentity, PeerConfig, PortForwardConfig, TomlConfigLoader,
-            VpnPortalClientConfig, VpnPortalConfig, add_proxy_network_to_config,
-            load_config_from_file, load_toml_config_from_path,
+            LoggingConfigLoader, NetworkIdentity, PeerConfig, PortForwardConfig,
+            ProxyProtocolVersion, TomlConfigLoader, VpnPortalClientConfig, VpnPortalConfig,
+            add_proxy_network_to_config, load_config_from_file, load_toml_config_from_path,
             load_toml_config_from_str_with_source, parse_mapped_listener_urls,
         },
         constants::EASYTIER_VERSION,
@@ -900,10 +900,29 @@ impl NetworkOptions {
                     panic!("failed to parse remote destination addr {}", example_str)
                 });
 
+            let mut proxy_protocol = None;
+            for (key, value) in port_forward.query_pairs() {
+                match key.as_ref() {
+                    "proxy_protocol" => {
+                        proxy_protocol = ProxyProtocolVersion::parse_optional(&value)
+                            .with_context(|| format!("invalid port forward {port_forward}"))?;
+                    }
+                    other => anyhow::bail!(
+                        "unknown port forward option {other} in {port_forward}, supported: proxy_protocol"
+                    ),
+                }
+            }
+            if proxy_protocol.is_some() && !port_forward.scheme().eq_ignore_ascii_case("tcp") {
+                anyhow::bail!(
+                    "proxy_protocol is only supported by tcp port forwards: {port_forward}"
+                );
+            }
+
             let port_forward_item = PortForwardConfig {
                 bind_addr,
                 dst_addr,
                 proto: port_forward.scheme().to_string(),
+                proxy_protocol,
             };
 
             let mut old = cfg.get_port_forwards();

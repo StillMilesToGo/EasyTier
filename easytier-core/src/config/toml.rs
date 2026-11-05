@@ -7,7 +7,10 @@ use std::{
 };
 
 use super::{DhcpConfig, normalize_secure_mode_config};
-pub use super::{EncryptionAlgorithm, gateway::PortForwardConfig};
+pub use super::{
+    EncryptionAlgorithm,
+    gateway::{PortForwardConfig, ProxyProtocolVersion},
+};
 use anyhow::Context;
 #[cfg(feature = "rich-config-errors")]
 use ariadne::{CharSet, Config as AriadneConfig, IndexType, Label, Report, ReportKind, Source};
@@ -1981,10 +1984,48 @@ proto = "tcp"
                 bind_addr: "0.0.0.0:11011".parse().unwrap(),
                 dst_addr: "192.168.94.33:11011".parse().unwrap(),
                 proto: "tcp".to_string(),
+                proxy_protocol: None,
             }],
             ret.get_port_forwards()
         );
         println!("{}", ret.dump());
+    }
+
+    #[test]
+    fn port_forward_proxy_protocol_round_trips() {
+        let config = TomlConfigLoader::new_from_str(
+            r#"
+[[port_forward]]
+bind_addr = "0.0.0.0:8080"
+dst_addr = "10.144.144.2:80"
+proto = "tcp"
+proxy_protocol = "v2"
+"#,
+        )
+        .unwrap();
+        let forwards = config.get_port_forwards();
+        assert_eq!(forwards[0].proxy_protocol, Some(ProxyProtocolVersion::V2));
+        let dumped = config.dump();
+        assert!(dumped.contains("proxy_protocol = \"v2\""), "{dumped}");
+
+        // Rules without the option keep serializing exactly as before.
+        let mut plain = forwards[0].clone();
+        plain.proxy_protocol = None;
+        config.set_port_forwards(vec![plain]);
+        assert!(!config.dump().contains("proxy_protocol"));
+
+        assert!(
+            TomlConfigLoader::new_from_str(
+                r#"
+[[port_forward]]
+bind_addr = "0.0.0.0:8080"
+dst_addr = "10.144.144.2:80"
+proto = "tcp"
+proxy_protocol = "v3"
+"#,
+            )
+            .is_err()
+        );
     }
 }
 

@@ -86,6 +86,10 @@ pub fn network_config_from_toml(config: &TomlConfig) -> NetworkConfig {
                 bind_port: forward.bind_addr.port() as u32,
                 dst_ip: forward.dst_addr.ip().to_string(),
                 dst_port: forward.dst_addr.port() as u32,
+                proxy_protocol: forward
+                    .proxy_protocol
+                    .map(|version| version.as_str().to_string())
+                    .unwrap_or_default(),
             })
             .collect();
     }

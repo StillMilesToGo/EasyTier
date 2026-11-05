@@ -1291,6 +1291,7 @@ source = "web"
                                 .into(),
                         ),
                         socket_type: SocketType::Tcp as i32,
+                        proxy_protocol: 0,
                     }),
                 }],
                 ..Default::default()
@@ -1429,6 +1430,7 @@ virtual_ip = "10.82.0.2/24"
                                 .into(),
                         ),
                         socket_type: SocketType::Tcp as i32,
+                        proxy_protocol: 0,
                     }),
                 }],
                 connectors: vec![UrlPatch {
@@ -2962,11 +2964,13 @@ virtual_ip = "10.82.0.2/24"
                 bind_addr: "127.0.0.1:18080".parse().unwrap(),
                 dst_addr: "10.144.0.2:80".parse().unwrap(),
                 proto: "tcp".to_owned(),
+                proxy_protocol: None,
             },
             PortForwardConfig {
                 bind_addr: "127.0.0.1:18081".parse().unwrap(),
                 dst_addr: "10.144.0.2:81".parse().unwrap(),
                 proto: "unsupported".to_owned(),
+                proxy_protocol: None,
             },
         ];
         let host = Arc::new(TestHost::default());
@@ -2995,6 +2999,7 @@ virtual_ip = "10.82.0.2/24"
                 bind_addr: SocketAddr::from(([127, 0, 0, 1], bind_port)),
                 dst_addr: SocketAddr::from(([10, 144, 0, 2], destination_port)),
                 proto: "tcp".to_owned(),
+                proxy_protocol: None,
             }
         }
 

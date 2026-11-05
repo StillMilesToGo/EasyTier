@@ -243,8 +243,8 @@ core_clap:
     en: "do not allow other nodes to use QUIC to proxy tcp streams to this node. when a node with QUIC proxy enabled accesses this node, the original tcp connection is preserved."
     zh-CN: "不允许其他节点使用 QUIC 代理 TCP 流到此节点。开启 QUIC 代理的节点访问此节点时，依然使用原始 TCP 连接。"
   port_forward:
-    en: "forward local port to remote port in virtual network. e.g.: udp://0.0.0.0:12345/10.126.126.1:23456, means forward local udp port 12345 to 10.126.126.1:23456 in the virtual network. can specify multiple."
-    zh-CN: "将本地端口转发到虚拟网络中的远程端口。例如：udp://0.0.0.0:12345/10.126.126.1:23456，表示将本地UDP端口12345转发到虚拟网络中的10.126.126.1:23456。可以指定多个。"
+    en: "forward local port to remote port in virtual network. e.g.: udp://0.0.0.0:12345/10.126.126.1:23456, means forward local udp port 12345 to 10.126.126.1:23456 in the virtual network. append ?proxy_protocol=v1 or ?proxy_protocol=v2 to a tcp forward to send a PROXY protocol header with the original client address to the destination. can specify multiple."
+    zh-CN: "将本地端口转发到虚拟网络中的远程端口。例如：udp://0.0.0.0:12345/10.126.126.1:23456，表示将本地UDP端口12345转发到虚拟网络中的10.126.126.1:23456。TCP 转发可追加 ?proxy_protocol=v1 或 ?proxy_protocol=v2，向目标发送携带原始客户端地址的 PROXY protocol 头。可以指定多个。"
   accept_dns:
     en: "if true, enable magic dns. with magic dns, you can access other nodes with a domain name, e.g.: <hostname>.et.net. magic dns will modify your system dns settings, enable it carefully."
     zh-CN: "如果为true，则启用魔法DNS。使用魔法DNS，您可以使用域名访问其他节点，例如：<hostname>.et.net。魔法DNS将修改您的系统DNS设置，请谨慎启用。"

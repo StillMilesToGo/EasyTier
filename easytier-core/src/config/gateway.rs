@@ -2,7 +2,9 @@ use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 
-use easytier_proto::common::{PortForwardConfigPb, SocketType};
+use easytier_proto::common::{
+    PortForwardConfigPb, ProxyProtocolVersion as ProxyProtocolVersionPb, SocketType,
+};
 
 /// Runtime configuration for the core-owned SOCKS and port-forward gateway.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -11,12 +13,59 @@ pub struct GatewayRuntimeConfig {
     pub port_forwards: Vec<PortForwardConfig>,
 }
 
+/// PROXY protocol version written ahead of forwarded TCP stream data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyProtocolVersion {
+    V1,
+    V2,
+}
+
+impl ProxyProtocolVersion {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+        }
+    }
+
+    /// Parses the management/CLI spelling. An empty string disables it.
+    pub fn parse_optional(value: &str) -> anyhow::Result<Option<Self>> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "none" | "off" | "disabled" => Ok(None),
+            "v1" | "1" => Ok(Some(Self::V1)),
+            "v2" | "2" => Ok(Some(Self::V2)),
+            other => anyhow::bail!("unsupported proxy_protocol: {other}, expected v1 or v2"),
+        }
+    }
+
+    pub fn from_pb(value: i32) -> Option<Self> {
+        match ProxyProtocolVersionPb::try_from(value) {
+            Ok(ProxyProtocolVersionPb::V1) => Some(Self::V1),
+            Ok(ProxyProtocolVersionPb::V2) => Some(Self::V2),
+            _ => None,
+        }
+    }
+
+    pub fn to_pb(value: Option<Self>) -> i32 {
+        match value {
+            None => ProxyProtocolVersionPb::Disabled as i32,
+            Some(Self::V1) => ProxyProtocolVersionPb::V1 as i32,
+            Some(Self::V2) => ProxyProtocolVersionPb::V2 as i32,
+        }
+    }
+}
+
 /// One TCP or UDP port-forward rule.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PortForwardConfig {
     pub bind_addr: SocketAddr,
     pub dst_addr: SocketAddr,
     pub proto: String,
+    /// Send a PROXY protocol header carrying the original client address to
+    /// the destination. Only TCP forwards support it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_protocol: Option<ProxyProtocolVersion>,
 }
 
 impl From<PortForwardConfigPb> for PortForwardConfig {
@@ -29,6 +78,7 @@ impl From<PortForwardConfigPb> for PortForwardConfig {
                 Ok(SocketType::Udp) => "udp".to_string(),
                 _ => "tcp".to_string(),
             },
+            proxy_protocol: ProxyProtocolVersion::from_pb(config.proxy_protocol),
         }
     }
 }
@@ -43,6 +93,7 @@ impl From<PortForwardConfig> for PortForwardConfigPb {
                 "udp" => SocketType::Udp as i32,
                 _ => SocketType::Tcp as i32,
             },
+            proxy_protocol: ProxyProtocolVersion::to_pb(config.proxy_protocol),
         }
     }
 }

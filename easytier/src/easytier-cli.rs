@@ -33,7 +33,10 @@ use easytier::service_manager::{Service, ServiceInstallOptions};
 use tokio::time::timeout;
 
 use easytier::{
-    common::{constants::EASYTIER_VERSION, stun::runtime_stun_info_collector},
+    common::{
+        config::ProxyProtocolVersion, constants::EASYTIER_VERSION,
+        stun::runtime_stun_info_collector,
+    },
     proto::{
         acl::{Acl, AclStats},
         api::{
@@ -369,6 +372,11 @@ enum PortForwardSubCommand {
         bind_addr: String,
         #[arg(help = "Destination address (e.g., 10.1.1.1:80)")]
         dst_addr: String,
+        #[arg(
+            long,
+            help = "Send a PROXY protocol header (v1/v2) with the original client address (tcp only)"
+        )]
+        proxy_protocol: Option<String>,
     },
     /// Remove port forward rule
     Remove {
@@ -378,6 +386,8 @@ enum PortForwardSubCommand {
         bind_addr: String,
         #[arg(help = "Optional Destination address (e.g., 10.1.1.1:80)")]
         dst_addr: Option<String>,
+        #[arg(long, help = "PROXY protocol version of the rule to remove (v1/v2)")]
+        proxy_protocol: Option<String>,
     },
     /// List port forward rules
     List,
@@ -2661,6 +2671,7 @@ impl<'a> CommandHandler<'a> {
         protocol: &str,
         bind_addr: &str,
         dst_addr: Option<&str>,
+        proxy_protocol: Option<&str>,
     ) -> Result<(), Error> {
         let bind_addr: std::net::SocketAddr = bind_addr
             .parse()
@@ -2671,6 +2682,12 @@ impl<'a> CommandHandler<'a> {
             "udp" => SocketType::Udp,
             _ => return Err(anyhow::anyhow!("Protocol must be 'tcp' or 'udp'")),
         };
+        let proxy_protocol = ProxyProtocolVersion::parse_optional(proxy_protocol.unwrap_or(""))?;
+        if proxy_protocol.is_some() && socket_type != SocketType::Tcp {
+            return Err(anyhow::anyhow!(
+                "--proxy-protocol is only supported by tcp port forwards"
+            ));
+        }
 
         let client = self.get_config_client().await?;
         let request = PatchConfigRequest {
@@ -2682,6 +2699,7 @@ impl<'a> CommandHandler<'a> {
                         bind_addr: Some(bind_addr.into()),
                         dst_addr: dst_addr.map(|s| s.parse::<SocketAddr>().unwrap().into()),
                         socket_type: socket_type.into(),
+                        proxy_protocol: ProxyProtocolVersion::to_pb(proxy_protocol),
                     }),
                 }],
                 ..Default::default()
@@ -2706,17 +2724,26 @@ impl<'a> CommandHandler<'a> {
         protocol: &str,
         bind_addr: &str,
         dst_addr: Option<&str>,
+        proxy_protocol: Option<&str>,
     ) -> Result<(), Error> {
         let protocol = protocol.to_string();
         let bind_addr = bind_addr.to_string();
         let dst_addr = dst_addr.map(str::to_string);
+        let proxy_protocol = proxy_protocol.map(str::to_string);
         self.apply_to_instances(|handler| {
             let protocol = protocol.clone();
             let bind_addr = bind_addr.clone();
             let dst_addr = dst_addr.clone();
+            let proxy_protocol = proxy_protocol.clone();
             Box::pin(async move {
                 handler
-                    .apply_port_forward_modify(action, &protocol, &bind_addr, dst_addr.as_deref())
+                    .apply_port_forward_modify(
+                        action,
+                        &protocol,
+                        &bind_addr,
+                        dst_addr.as_deref(),
+                        proxy_protocol.as_deref(),
+                    )
                     .await
             })
         })
@@ -2736,6 +2763,7 @@ impl<'a> CommandHandler<'a> {
             protocol: String,
             bind_addr: String,
             dst_addr: String,
+            proxy_protocol: String,
         }
 
         self.print_results(&results, |response| {
@@ -2756,6 +2784,9 @@ impl<'a> CommandHandler<'a> {
                         .dst_addr
                         .map(|addr| addr.to_string())
                         .unwrap_or_default(),
+                    proxy_protocol: ProxyProtocolVersion::from_pb(rule.proxy_protocol)
+                        .map(|version| version.as_str().to_string())
+                        .unwrap_or_else(|| "-".to_string()),
                 })
                 .collect();
 
@@ -3974,6 +4005,7 @@ async fn main() -> Result<(), Error> {
                 protocol,
                 bind_addr,
                 dst_addr,
+                proxy_protocol,
             }) => {
                 handler
                     .handle_port_forward_modify(
@@ -3981,6 +4013,7 @@ async fn main() -> Result<(), Error> {
                         protocol,
                         bind_addr,
                         Some(dst_addr),
+                        proxy_protocol.as_deref(),
                     )
                     .await?;
             }
@@ -3988,6 +4021,7 @@ async fn main() -> Result<(), Error> {
                 protocol,
                 bind_addr,
                 dst_addr,
+                proxy_protocol,
             }) => {
                 handler
                     .handle_port_forward_modify(
@@ -3995,6 +4029,7 @@ async fn main() -> Result<(), Error> {
                         protocol,
                         bind_addr,
                         dst_addr.as_deref(),
+                        proxy_protocol.as_deref(),
                     )
                     .await?;
             }

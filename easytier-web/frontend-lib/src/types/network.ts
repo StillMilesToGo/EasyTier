@@ -568,6 +568,7 @@ export const addRow = (rows: PortForwardConfig[]) => {
     bind_port: 65535,
     dst_ip: '',
     dst_port: 65535,
+    proxy_protocol: '',
   });
 };
 

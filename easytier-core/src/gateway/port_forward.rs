@@ -14,6 +14,7 @@ use crossbeam_utils::atomic::AtomicCell;
 use dashmap::DashMap;
 use quanta::Instant;
 use tokio::{
+    io::AsyncWriteExt,
     select,
     sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore},
     task::{JoinHandle, JoinSet},
@@ -329,6 +330,11 @@ where
                     cfg.proto
                 );
             }
+            anyhow::ensure!(
+                cfg.proxy_protocol.is_none() || cfg.proto == "tcp",
+                "proxy_protocol is only supported by tcp port forwards: {}",
+                cfg.bind_addr
+            );
             let key = (cfg.proto.clone(), cfg.bind_addr);
             if let Some(previous) = configs.insert(key, cfg.clone()) {
                 anyhow::ensure!(
@@ -440,13 +446,20 @@ where
                 else {
                     break;
                 };
-                let dst_addr = task_config.lock().unwrap().dst_addr;
+                let (dst_addr, proxy_protocol) = {
+                    let config = task_config.lock().unwrap();
+                    (config.dst_addr, config.proxy_protocol)
+                };
                 tracing::info!(
                     ?bind_addr,
                     ?source_addr,
                     ?dst_addr,
+                    ?proxy_protocol,
                     "port-forward accepted local connection"
                 );
+                // The PROXY header reports the address the client actually
+                // reached, which is more precise than a wildcard bind address.
+                let local_addr = incoming.local_addr().unwrap_or(bind_addr);
                 let data_plane = data_plane.clone();
                 connections.lock().unwrap().spawn(async move {
                     tracing::info!(
@@ -459,7 +472,7 @@ where
                         TcpSocketPurpose::PortForward,
                         source_addr,
                     );
-                    let outgoing = match data_plane.connect_tcp(dst_addr, options).await {
+                    let mut outgoing = match data_plane.connect_tcp(dst_addr, options).await {
                         Ok(stream) => stream,
                         Err(error) => {
                             tracing::error!(?error, ?dst_addr, "port-forward connect failed");
@@ -467,6 +480,18 @@ where
                         }
                     };
                     tracing::info!(?source_addr, ?dst_addr, "port-forward data-plane connected");
+                    if let Some(version) = proxy_protocol {
+                        let header =
+                            proxy_protocol::encode_header(version, source_addr, local_addr);
+                        if let Err(error) = outgoing.write_all(&header).await {
+                            tracing::error!(
+                                ?error,
+                                ?dst_addr,
+                                "port-forward PROXY protocol header write failed"
+                            );
+                            return;
+                        }
+                    }
                     copy_tcp(incoming, outgoing, dst_addr).await;
                 });
             }
@@ -833,6 +858,8 @@ where
     }
 }
 
+mod proxy_protocol;
+
 #[cfg(test)]
 mod reload_tests;
 
@@ -945,6 +972,7 @@ mod tests {
                 bind_addr: "127.0.0.1:5202".parse().unwrap(),
                 dst_addr: "10.144.0.20:5201".parse().unwrap(),
                 proto: "udp".to_owned(),
+                proxy_protocol: None,
             },
         }
     }
